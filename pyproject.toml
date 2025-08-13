@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ludi"
+dependencies = [
+    "headless-ida",
+    "angr",
+    "pyhidra",
+    "pyyaml"
+]
+readme = "README.md"
+description = "Ludi Unifies Decompiler Interfaces"
+authors = [
+    {name = "Han Dai", email = "pypi@han.do"},
+]
+license = {file = "LICENSE"}
+requires-python = ">=3"
+dynamic = ["version"]
+
+[project.scripts]
+ludi = "ludi.cli.main:main"
+
+[project.urls]
+homepage = "https://github.com/DennyDai/LUDI"
+documentation = "https://github.com/DennyDai/LUDI"
+repository = "https://github.com/DennyDai/LUDI"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+# empty
