@@ -159,3 +159,22 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 
 .idea/
+
+# VSCode
+.vscode/
+
+# LUDI specific
+*.ludi
+.ludi/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# MacOS
+.DS_Store
+
+# ruff
+.ruff_cache/

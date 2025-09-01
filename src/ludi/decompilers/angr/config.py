@@ -1,77 +1,47 @@
-"""angr configuration management."""
-
-import os
-from dataclasses import dataclass
-from pathlib import Path
+import importlib.util
 from typing import Optional
 
-from ..base.config import ConfigProvider, BackendConfig, get_config_manager
-
-
-@dataclass
-class AngrConfig:
-    """angr configuration."""
-    auto_load_libs: bool = False
-    use_sim_procedures: bool = True
-    load_debug_info: bool = True
+from ..base.config import ConfigProvider
 
 
 class AngrConfigProvider(ConfigProvider):
-    """angr-specific configuration provider."""
-    
-    def __init__(self):
-        self._config = BackendConfig(enabled=True)  # Angr is enabled by default if importable
-    
     @property
     def backend_name(self) -> str:
         return "angr"
-    
-    def get_config(self) -> BackendConfig:
-        return self._config
-    
-    def set_config(self, config: BackendConfig) -> None:
-        self._config = config
-    
+
+    def get_default_config(self) -> dict:
+        return {
+            "auto_load_libs": False,  # Performance optimization
+            "load_debug_info": False,  # Performance optimization
+            "use_sim_procedures": True,
+        }
+
     def auto_discover(self) -> Optional[str]:
-        """Auto-discover angr installation (Python package)."""
-        try:
-            import angr
-            # For Python packages, return the actual package directory
-            if hasattr(angr, '__path__') and angr.__path__:
-                return str(Path(angr.__path__[0]))
-            return None
-        except ImportError:
-            return None
-    
+        if importlib.util.find_spec("angr") is not None:
+            return "python-package"
+        return None
+
     def validate(self, path: Optional[str] = None) -> bool:
-        """Validate angr installation."""
-        if path is None:
-            path = self._config.path
-            
-        if not path:
-            return False
-            
-        # For angr, we just need to check if it's importable
-        try:
-            import angr
-            return True
-        except ImportError:
-            return False
+        return importlib.util.find_spec("angr") is not None
 
+    def run_script(self, script_path: str, binary_path: str = None, script_args: list = None):
+        import os
+        import subprocess
+        import sys
 
-def get_angr_config() -> AngrConfig:
-    """Get angr configuration from environment."""
-    auto_load_libs = os.environ.get('LUDI_ANGR_AUTO_LOAD_LIBS', 'false').lower() == 'true'
-    use_sim_procedures = os.environ.get('LUDI_ANGR_USE_SIM_PROCEDURES', 'true').lower() == 'true'
-    load_debug_info = os.environ.get('LUDI_ANGR_LOAD_DEBUG_INFO', 'true').lower() == 'true'
-    
-    return AngrConfig(
-        auto_load_libs=auto_load_libs,
-        use_sim_procedures=use_sim_procedures,
-        load_debug_info=load_debug_info
-    )
+        cmd = [sys.executable, script_path]
 
+        env = os.environ.copy()
 
-# Auto-register angr provider when this module is imported
-_angr_provider = AngrConfigProvider()
-get_config_manager().register_provider(_angr_provider)
+        if binary_path:
+            env["LUDI_BINARY_PATH"] = binary_path
+
+        if script_args:
+            cmd.extend(script_args)
+
+        print(f"Executing: {' '.join(cmd)}")
+        if binary_path:
+            print(f"Binary available via environment variable: LUDI_BINARY_PATH={binary_path}")
+
+        result = subprocess.run(cmd, env=env, capture_output=False)
+        sys.exit(result.returncode)

@@ -1,41 +1,18 @@
-from importlib import metadata
-
-# Import decompilers module to trigger auto-registration
-from . import decompilers
-
-from .decompilers.ida import Ida
-from .ludi import LUDI, ida, auto
-
-# Import other decompilers if available
-try:
-    from .decompilers.ghidra import Ghidra
-    __all__ = ["LUDI", "Ida", "Ghidra", "ida", "auto", "__version__"]
-except ImportError:
-    __all__ = ["LUDI", "Ida", "ida", "auto", "__version__"]
-
-try:
-    from .decompilers.angr import Angr
-    if "Angr" not in __all__:
-        __all__.insert(-2, "Angr")  # Insert before "auto" and "__version__"
-except ImportError:
-    pass
-
-# Import convenience functions for other decompilers
-try:
-    from .ludi import ghidra
-    globals()["ghidra"] = ghidra
-    if "ghidra" not in __all__:
-        __all__.insert(-1, "ghidra")  # Insert before "__version__"
-except (ImportError, NameError):
-    pass
-
-try:
-    from .ludi import angr as angr_func
-    globals()["angr"] = angr_func
-    if "angr" not in __all__:
-        __all__.insert(-1, "angr")  # Insert before "__version__"
-except (ImportError, NameError):
-    pass
+from .ludi import LUDI, SUPPORTED_BACKENDS
 
 
-__version__ = metadata.version("ludi")
+# Create dynamic backend functions
+def _create_backend_function(backend_name):
+    def backend_func(binary_path, **kwargs):
+        return LUDI(backend_name, binary_path, **kwargs)
+
+    backend_func.__name__ = backend_name
+    backend_func.__doc__ = f"Create a LUDI analyzer using the {backend_name} backend."
+    return backend_func
+
+
+# Add dynamic backend functions to module
+for backend_name in SUPPORTED_BACKENDS.keys():
+    globals()[backend_name] = _create_backend_function(backend_name)
+
+__all__ = ["LUDI"] + list(SUPPORTED_BACKENDS.keys())

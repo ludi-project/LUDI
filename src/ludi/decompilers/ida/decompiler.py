@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from headless_ida import HeadlessIda
 
-from ..base import DecompilerBase, FunctionManager, XRefManager, SymbolManager, BinaryManager
-from .config import get_ida_config
-from .managers import IdaFunctionManager, IdaXRefManager, IdaSymbolManager, IdaBinaryManager
+from ..base.decompiler import DecompilerBase
+from ..base.managers import ArchitectureManager, BinaryManager, FunctionManager, MemoryManager, SymbolManager, TypeManager, XRefManager
+from .managers import IdaArchitectureManager, IdaBinaryManager, IdaFunctionManager, IdaMemoryManager, IdaSymbolManager, IdaTypeManager, IdaXRefManager
 
 
 class IdaNative:
@@ -40,40 +40,63 @@ class IdaNative:
             setattr(self, lib, self._headlessida.import_module(lib))
 
 
-
 class Ida(DecompilerBase):
     def __init__(self, binary_path: str, **kwargs) -> None:
         super().__init__(binary_path, **kwargs)
-        
-        # Get IDA path from config
-        ida_config = get_ida_config()
-        ida_path = ida_config.path
+
+        ida_path = kwargs.get("path")
         if not ida_path:
-            raise RuntimeError("IDA path not configured. Set LUDI_IDA_PATH environment variable or use config.")
-        
-        self.native = IdaNative(binary_path, ida_path, **kwargs)
+            raise RuntimeError("IDA path not provided. Use LUDI class for proper initialization.")
+        if ida_path == "builtin":
+            # Debug: print more details about why we're getting builtin
+            from ..base.config import get_config_manager
+
+            config_manager = get_config_manager()
+            ida_config = config_manager.get_backend_config("ida")
+            raise RuntimeError(
+                f"Invalid IDA path: {ida_path}. Config path: {ida_config.path if ida_config else 'NO CONFIG'}. Kwargs: {kwargs}"
+            )
+
+        # Remove ida_path from kwargs since it's passed as positional arg
+        kwargs_for_native = kwargs.copy()
+        kwargs_for_native.pop("path", None)
+        self.native = IdaNative(binary_path, ida_path, **kwargs_for_native)
         self._function_manager = IdaFunctionManager(self.native, self)
         self._xref_manager = IdaXRefManager(self.native, self)
         self._symbol_manager = IdaSymbolManager(self.native, self)
         self._binary_manager = IdaBinaryManager(self.native, self)
+        self._type_manager = IdaTypeManager(self.native, self)
+        self._architecture_manager = IdaArchitectureManager(self.native, self)
+        self._memory_manager = IdaMemoryManager(self.native, self)
 
     @property
     def functions(self) -> FunctionManager:
-        """Get the function manager for this decompiler."""
         return self._function_manager
-    
+
     @property
     def xrefs(self) -> XRefManager:
-        """Get the cross-reference manager for this decompiler."""
         return self._xref_manager
-    
+
     @property
     def symbols(self) -> SymbolManager:
-        """Get the symbol manager for this decompiler."""
         return self._symbol_manager
-    
+
     @property
     def binary(self) -> BinaryManager:
-        """Get the binary manager for this decompiler."""
         return self._binary_manager
 
+    @property
+    def types(self) -> TypeManager:
+        return self._type_manager
+
+    @property
+    def architecture(self) -> ArchitectureManager:
+        return self._architecture_manager
+
+    @property
+    def memory(self) -> MemoryManager:
+        return self._memory_manager
+
+    @property
+    def backend_name(self) -> str:
+        return "ida"

@@ -1,247 +1,224 @@
 import os
-import yaml
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from ...logger import get_logger
+
+logger = get_logger("decompilers.base.config")
 
 
 @dataclass
 class BackendConfig:
-    """Configuration for a decompiler backend."""
+    type: str  # Backend type name
+    autodiscover: bool = False
+
     path: Optional[str] = None
     enabled: bool = True
-    auto_discover: bool = True
+
+    server: Optional[str] = None
+    port: Optional[int] = None
+    protocol: str = "http"
+    auth: Dict[str, Any] = field(default_factory=dict)
+
     options: Dict[str, Any] = field(default_factory=dict)
 
 
 class ConfigProvider(ABC):
-    """Abstract base class for decompiler-specific configuration providers."""
-    
     @property
     @abstractmethod
     def backend_name(self) -> str:
-        """Name of the backend (e.g., 'ida', 'ghidra', 'angr')."""
         pass
-    
-    @abstractmethod
-    def get_config(self) -> BackendConfig:
-        """Get current configuration for this backend."""
-        pass
-    
-    @abstractmethod
-    def set_config(self, config: BackendConfig) -> None:
-        """Set configuration for this backend."""
-        pass
-    
+
     @abstractmethod
     def auto_discover(self) -> Optional[str]:
-        """Auto-discover installation path for this backend."""
         pass
-    
+
     @abstractmethod
     def validate(self, path: Optional[str] = None) -> bool:
-        """Validate backend installation."""
         pass
-    
-    def is_available(self) -> bool:
-        """Check if this backend is available and working."""
-        config = self.get_config()
-        return config.enabled and self.validate(config.path)
 
-
-@dataclass
-class LudiConfig:
-    """Main LUDI configuration."""
-    default_backend: Optional[str] = None
-    global_options: Dict[str, Any] = field(default_factory=dict)
+    def run_script(self, script_path: str, binary_path: str = None, script_args: list = None):
+        raise NotImplementedError(f"Script execution not supported for {self.backend_name} backend")
 
 
 class ConfigManager:
-    """
-    Plugin-based configuration manager.
-    Each decompiler registers its own ConfigProvider.
-    """
-    
-    CONFIG_DIR = Path.home() / ".ludi"
-    CONFIG_FILE = CONFIG_DIR / "config.yaml"
-    
     def __init__(self):
-        self._config = LudiConfig()
+        self._config_path = self._get_config_path()
+        self._config: Dict[str, BackendConfig] = {}
         self._providers: Dict[str, ConfigProvider] = {}
         self._loaded = False
-    
+
+    def _get_config_path(self) -> Path:
+        if os.name == "nt":  # Windows
+            config_dir = Path(os.environ.get("APPDATA", "~")) / "ludi"
+        else:  # Linux/Mac
+            xdg_config = os.environ.get("XDG_CONFIG_HOME", "~/.config")
+            config_dir = Path(xdg_config).expanduser() / "ludi"
+        return config_dir / "config.yaml"
+
     def register_provider(self, provider: ConfigProvider):
-        """Register a configuration provider for a backend."""
         self._providers[provider.backend_name] = provider
-        
-        # Immediately load env vars for this provider
-        self._load_provider_from_env(provider)
-        
-        # Auto-discover if needed
-        config = provider.get_config()
-        if config.auto_discover and not config.path:
-            if discovered_path := provider.auto_discover():
-                config.path = discovered_path
-                provider.set_config(config)
-    
-    def get_providers(self) -> List[ConfigProvider]:
-        """Get all registered providers."""
-        return list(self._providers.values())
-    
-    def load(self) -> LudiConfig:
-        """Load configuration from all sources."""
+
+    def load_config(self) -> Dict[str, BackendConfig]:
         if self._loaded:
             return self._config
-        
-        # 1. Load from config file
+
+        if not self._config_path.exists():
+            self._generate_initial_config()
+
         self._load_from_file()
-        
-        # 2. Override with environment variables
-        self._load_from_env()
-        
-        # 3. Auto-discover if needed
-        self._auto_discover_tools()
-        
+        self._update_autodiscovered()
         self._loaded = True
         return self._config
-    
+
+    def _generate_initial_config(self):
+        logger.info("First run detected. Generating configuration...")
+
+        config = {}
+
+        for provider in self._providers.values():
+            if provider.backend_name == "auto":
+                continue
+
+            discovered_path = provider.auto_discover()
+            if discovered_path and provider.validate(discovered_path):
+                config[provider.backend_name] = {
+                    "type": provider.backend_name,
+                    "autodiscover": True,
+                }
+            else:
+                config[provider.backend_name] = {
+                    "type": provider.backend_name,
+                    "autodiscover": True,
+                    "enabled": False,
+                }
+
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._config_path, "w") as f:
+            f.write("# LUDI configuration file - named backends\n")
+            f.write("# Edit this file to add custom backends or disable autodiscovery\n")
+            f.write("\n")
+
+            yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
+
+        logger.info(f"Configuration created at: {self._config_path}")
+        logger.info("Edit this file to add custom backends or disable autodiscovery")
+
     def _load_from_file(self):
-        """Load configuration from YAML file."""
-        if not self.CONFIG_FILE.exists():
-            return
-        
         try:
-            with open(self.CONFIG_FILE, 'r') as f:
+            with open(self._config_path) as f:
                 data = yaml.safe_load(f) or {}
-            
-            # Load global config
-            self._config.default_backend = data.get('default_backend')
-            self._config.global_options = data.get('global_options', {})
-            
-            # Let each provider load its own config
-            for provider in self._providers.values():
-                if provider.backend_name in data:
-                    backend_data = data[provider.backend_name]
-                    config = BackendConfig(**backend_data)
-                    provider.set_config(config)
-            
+
+            self._config = {}
+            for name, config_dict in data.items():
+                if name.startswith("_"):  # Skip metadata
+                    continue
+
+                self._config[name] = BackendConfig(**config_dict)
+
         except Exception as e:
-            print(f"Warning: Could not load config file: {e}")
-    
-    def _load_from_env(self):
-        """Load configuration from environment variables."""
-        # Global settings
-        if default_backend := os.environ.get('LUDI_DEFAULT_BACKEND'):
-            self._config.default_backend = default_backend
-        
-        # Let each provider handle its own environment variables
-        for provider in self._providers.values():
-            self._load_provider_from_env(provider)
-    
-    def _load_provider_from_env(self, provider: ConfigProvider):
-        """Load environment variables for a specific provider."""
-        # Standard env var pattern: LUDI_{BACKEND}_PATH, LUDI_{BACKEND}_ENABLED
-        backend_upper = provider.backend_name.upper()
-        
-        config = provider.get_config()
-        changed = False
-        
-        if path := os.environ.get(f'LUDI_{backend_upper}_PATH'):
-            config.path = path
-            changed = True
-        
-        if enabled := os.environ.get(f'LUDI_{backend_upper}_ENABLED'):
-            config.enabled = enabled.lower() in ('true', '1', 'yes')
-            changed = True
-        
-        if changed:
-            provider.set_config(config)
-    
-    def _auto_discover_tools(self):
-        """Auto-discover decompiler installations."""
-        for provider in self._providers.values():
-            config = provider.get_config()
-            if config.auto_discover and not config.path:
-                if discovered_path := provider.auto_discover():
-                    config.path = discovered_path
-                    provider.set_config(config)
-    
-    def save(self):
-        """Save configuration to file."""
-        # Create config directory if it doesn't exist
-        self.CONFIG_DIR.mkdir(exist_ok=True)
-        
-        # Build config dict from all providers
-        config_dict = {
-            'default_backend': self._config.default_backend,
-            'global_options': self._config.global_options
-        }
-        
-        # Add each backend's config
-        for provider in self._providers.values():
-            backend_config = provider.get_config()
-            config_dict[provider.backend_name] = {
-                'path': backend_config.path,
-                'enabled': backend_config.enabled,
-                'auto_discover': backend_config.auto_discover,
-                'options': backend_config.options
-            }
-        
-        with open(self.CONFIG_FILE, 'w') as f:
-            yaml.dump(config_dict, f, default_flow_style=False)
-    
-    def get_backend_config(self, backend: str) -> BackendConfig:
-        """Get configuration for specific backend."""
+            logger.warning(f"Could not load config file: {e}")
+            self._config = {}
+
+    def _update_autodiscovered(self):
+        for name, config in self._config.items():
+            if config.type == "local" and config.autodiscover:
+                if name in self._providers:
+                    provider = self._providers[name]
+                    discovered_path = provider.auto_discover()
+                    if discovered_path and provider.validate(discovered_path):
+                        config.path = discovered_path
+                        config.enabled = True
+                    else:
+                        config.enabled = False
+
+    def save_config(self):
+        config_dict = {}
+
+        for name, config in self._config.items():
+            entry = {"type": config.type}
+
+            if config.autodiscover:
+                entry["autodiscover"] = config.autodiscover
+            if not config.enabled:
+                entry["enabled"] = config.enabled
+            if config.path:  # Save path when explicitly set
+                entry["path"] = config.path
+
+            if config.type == "remote":
+                if config.server:
+                    entry["server"] = config.server
+                if config.port:
+                    entry["port"] = config.port
+                if config.protocol != "http":
+                    entry["protocol"] = config.protocol
+                if config.auth:
+                    entry["auth"] = config.auth
+
+            if config.options:
+                entry["options"] = config.options
+
+            config_dict[name] = entry
+
+        with open(self._config_path, "w") as f:
+            f.write("# LUDI configuration file - named backends\n")
+            f.write("# Edit this file to add custom backends or disable autodiscovery\n")
+            f.write("\n")
+
+            yaml.dump(config_dict, f, default_flow_style=False, indent=2, sort_keys=False)
+
+    def get_config(self, name: str) -> Optional[BackendConfig]:
         if not self._loaded:
-            self.load()
-        
-        if backend not in self._providers:
-            raise ValueError(f"No provider registered for backend: {backend}")
-        
-        return self._providers[backend].get_config()
-    
-    def set_backend_path(self, backend: str, path: str):
-        """Set path for specific backend."""
+            self.load_config()
+        return self._config.get(name)
+
+    def add_backend(self, name: str, config: BackendConfig):
         if not self._loaded:
-            self.load()
-        
-        if backend not in self._providers:
-            raise ValueError(f"No provider registered for backend: {backend}")
-        
-        config = self._providers[backend].get_config()
-        config.path = path
-        self._providers[backend].set_config(config)
-    
+            self.load_config()
+        self._config[name] = config
+
+    def list_backends(self) -> Dict[str, str]:
+        if not self._loaded:
+            self.load_config()
+        return {name: config.type for name, config in self._config.items()}
+
     def get_available_backends(self) -> List[str]:
-        """Get list of available and enabled backends."""
         if not self._loaded:
-            self.load()
-        
+            self.load_config()
+
         available = []
-        for provider in self._providers.values():
-            if provider.is_available():
-                available.append(provider.backend_name)
-        
+        for name, config in self._config.items():
+            if config.enabled:
+                if name in self._providers:
+                    provider = self._providers[name]
+                    path_to_validate = config.path
+                    if config.autodiscover and not path_to_validate:
+                        path_to_validate = provider.auto_discover()
+
+                    if provider.validate(path_to_validate):
+                        available.append(name)
+                else:
+                    available.append(name)
+
+        if available and "auto" not in available:
+            available.append("auto")
+
         return available
-    
-    def validate(self) -> Dict[str, bool]:
-        """Validate configuration and return status for each backend."""
-        if not self._loaded:
-            self.load()
-        
-        return {
-            provider.backend_name: provider.validate()
-            for provider in self._providers.values()
-        }
+
+    def get_backend_config(self, backend_name: str) -> Optional[BackendConfig]:
+        config = self.get_config(backend_name)
+        return config
+
+    def get_providers(self) -> List[ConfigProvider]:
+        return list(self._providers.values())
 
 
-# Global config manager instance
-_config_manager = None
+_config_manager = ConfigManager()
+
 
 def get_config_manager() -> ConfigManager:
-    """Get global configuration manager instance."""
-    global _config_manager
-    if _config_manager is None:
-        _config_manager = ConfigManager()
     return _config_manager
