@@ -1,95 +1,83 @@
-"""angr manager implementations."""
+from typing import List, Optional
 
-from typing import List, Optional, Dict, Any
-from ..base import FunctionManager, XRefManager, SymbolManager, BinaryManager
-from ..base import Function, BasicBlock, XRef, Symbol, Instruction, Variable, Type
+from ..base.managers import ArchitectureManager, BinaryManager, FunctionManager, MemoryManager, SymbolManager, TypeManager, XRefManager
+from ..base.types import BasicBlock, Function, Instruction, Symbol, Type, Variable, XRef
 
 
 class AngrFunctionManager(FunctionManager):
-    """angr function implementation."""
-    
     def __init__(self, angr_native, analyzer=None):
         self.angr = angr_native
         self._analyzer = analyzer
-    
-    def get_available_levels(self) -> List[str]:
-        """Get available representation levels."""
+
+    def available_levels(self) -> List[str]:
         levels = ["disassembly", "vex"]
-        # Check if decompiler is available
         try:
-            if hasattr(self.angr, 'analyses') and hasattr(self.angr.analyses, 'Decompiler'):
+            if hasattr(self.angr, "analyses") and hasattr(self.angr.analyses, "Decompiler"):
                 levels.append("pseudocode")
-        except:
+        except (AttributeError, ImportError):
             pass
         return levels
-    
-    def get_all(self, level: Optional[str] = None) -> List[Function]:
-        """Get all functions, optionally at specific representation level."""
+
+    def all(self, level: Optional[str] = None) -> List[Function]:
         functions = []
-        
+
         try:
-            # Use angr's CFG to get functions
-            if not hasattr(self.angr, '_cfg'):
-                # Generate CFG if not exists
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
-            
-            for func_addr, func in cfg.functions.items():
+
+            for _func_addr, func in cfg.functions.items():
                 name = func.name if func.name else None
-                # Calculate size from basic blocks
                 size = 0
                 if func.blocks:
                     addresses = [block.addr for block in func.blocks]
                     if addresses:
                         size = max(addresses) - min(addresses) + 4  # Rough estimate
-                
-                functions.append(Function(
-                    start=func.addr,
-                    end=func.addr + size,
-                    name=name,
-                    size=size,
-                    level=level or "disassembly",
-                    _manager=self,
-                    _native=func
-                ))
+
+                functions.append(
+                    Function(
+                        start=func.addr,
+                        end=func.addr + size,
+                        name=name,
+                        size=size,
+                        level=level or "disassembly",
+                        _manager=self,
+                        _native=func,
+                    )
+                )
         except Exception:
-            # CFG generation can fail, return empty list
             pass
-        
+
         return functions
-    
-    def get_by_address(self, addr: int, level: Optional[str] = None) -> Optional[Function]:
-        """Get function at address, optionally at specific level."""
-        for func in self.get_all(level):
+
+    def by_address(self, addr: int, level: Optional[str] = None) -> Optional[Function]:
+        for func in self.all(level):
             if func.start == addr:
                 return func
         return None
-    
-    def get_by_name(self, name: str) -> Optional[Function]:
-        """Get function by name."""
-        for func in self.get_all():
+
+    def by_name(self, name: str) -> Optional[Function]:
+        for func in self.all():
             if func.name == name:
                 return func
         return None
-    
-    def get_function_containing(self, addr: int, level: Optional[str] = None) -> Optional[Function]:
-        """Get function that contains the given address."""
+
+    def containing(self, addr: int, level: Optional[str] = None) -> Optional[Function]:
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
             func = cfg.functions.floor_func(addr)
-            
+
             if func and func.addr <= addr:
-                # Check if address is within function bounds
                 if func.blocks:
                     max_addr = max(block.addr + block.size for block in func.blocks)
                     if addr < max_addr:
                         name = func.name if func.name else None
                         size = max_addr - func.addr
-                        
+
                         return Function(
                             start=func.addr,
                             end=func.addr + size,
@@ -97,56 +85,51 @@ class AngrFunctionManager(FunctionManager):
                             size=size,
                             level=level or "disassembly",
                             _manager=self,
-                            _native=func
+                            _native=func,
                         )
         except Exception:
             pass
-        
+
         return None
-    
-    def get_decompiled_code(self, addr: int, level: Optional[str] = None) -> Optional[str]:
-        """Get decompiled code for function at address."""
+
+    def decompiled_code(self, addr: int, level: Optional[str] = None) -> Optional[str]:
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
             func = cfg.functions.get(addr)
             if not func:
                 func = cfg.functions.floor_func(addr)
-            
+
             if func:
                 if level == "pseudocode" or level is None:
-                    # Try to use angr's decompiler
                     try:
-                        if hasattr(self.angr.analyses, 'Decompiler'):
-                            # Normalize the function before decompilation
-                            # This is required by angr's decompiler
+                        if hasattr(self.angr.analyses, "Decompiler"):
                             try:
                                 func.normalize()
                             except Exception:
-                                # Normalization may fail for some functions, continue anyway
                                 pass
-                            
+
                             dec = self.angr.analyses.Decompiler(func, fail_fast=True)
                             if dec.codegen and dec.codegen.text:
                                 return dec.codegen.text
                     except Exception:
                         pass
-                
-                # Fallback to disassembly
+
                 if level == "disassembly" or level is None:
                     try:
                         disasm_lines = []
                         for block in func.blocks:
                             block_obj = self.angr.factory.block(block.addr, size=block.size)
                             for insn in block_obj.disassembly.insns:
-                                disasm_lines.append(f"0x{insn.address:x}: {insn.mnemonic} {insn.op_str}")
+                                disasm_lines.append(
+                                    f"0x{insn.address:x}: {insn.mnemonic} {insn.op_str}"
+                                )
                         return "\n".join(disasm_lines)
                     except Exception:
                         pass
-                
-                # VEX IR fallback
+
                 if level == "vex":
                     try:
                         vex_lines = []
@@ -159,119 +142,129 @@ class AngrFunctionManager(FunctionManager):
                         pass
         except Exception:
             pass
-        
+
         return None
-    
-    def get_basic_blocks(self, addr: int, level: Optional[str] = None) -> List[BasicBlock]:
-        """Get basic blocks for function."""
+
+    def basic_blocks(self, addr: int, level: Optional[str] = None) -> List[BasicBlock]:
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
             func = cfg.functions.get(addr)
             if not func:
                 func = cfg.functions.floor_func(addr)
-            
+
             if func:
                 blocks = []
                 for block in func.blocks:
-                    # Get instructions for this block
                     instructions = []
                     try:
                         block_obj = self.angr.factory.block(block.addr, size=block.size)
                         for insn in block_obj.disassembly.insns:
-                            instructions.append(Instruction(
-                                address=insn.address,
-                                mnemonic=insn.mnemonic,
-                                operands=[insn.op_str] if insn.op_str else [],
-                                level=level or "disassembly",
-                                _native=insn
-                            ))
+                            instructions.append(
+                                Instruction(
+                                    address=insn.address,
+                                    mnemonic=insn.mnemonic,
+                                    operands=[insn.op_str] if insn.op_str else [],
+                                    level=level or "disassembly",
+                                    _native=insn,
+                                )
+                            )
                     except Exception:
-                        # If disassembly fails, create placeholder
-                        instructions.append(Instruction(
-                            address=block.addr,
-                            mnemonic="unknown",
-                            operands=[],
+                        instructions.append(
+                            Instruction(
+                                address=block.addr,
+                                mnemonic="unknown",
+                                operands=[],
+                                level=level or "disassembly",
+                                _native=None,
+                            )
+                        )
+
+                    blocks.append(
+                        BasicBlock(
+                            start=block.addr,
+                            end=block.addr + block.size,
+                            instructions=instructions,
+                            size=block.size,
                             level=level or "disassembly",
-                            _native=None
-                        ))
-                    
-                    blocks.append(BasicBlock(
-                        start=block.addr,
-                        end=block.addr + block.size,
-                        instructions=instructions,
-                        size=block.size,
-                        level=level or "disassembly",
-                        _native=block
-                    ))
-                
+                            _native=block,
+                        )
+                    )
+
                 return blocks
         except Exception:
             pass
-        
+
         return []
-    
-    def get_instructions(self, addr: int, level: Optional[str] = None) -> List[Instruction]:
-        """Get instructions for function at specific level."""
+
+    def instructions(self, addr: int, level: Optional[str] = None) -> List[Instruction]:
         instructions = []
-        for block in self.get_basic_blocks(addr, level):
+        for block in self.basic_blocks(addr, level):
             instructions.extend(block.instructions)
         return instructions
 
+    def cfg(self, addr: int):
+        return None
+
+    def call_graph(self):
+        return None
+
+    def representation(self, addr: int, level: str = "disasm") -> Optional[str]:
+        return self.decompiled_code(addr, level)
+
+    def string_references(self, addr: int) -> List[tuple]:
+        return []
+
+
 
 class AngrXRefManager(XRefManager):
-    """angr xref implementation."""
-    
     def __init__(self, angr_native, analyzer=None):
         self.angr = angr_native
         self._analyzer = analyzer
-    
+
     def get_xrefs_to(self, addr: int) -> List[XRef]:
-        """Get xrefs to address."""
         xrefs = []
-        
+
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
-            
-            # Look for references to this address
-            for func_addr, func in cfg.functions.items():
+
+            for _func_addr, func in cfg.functions.items():
                 for block in func.blocks:
                     try:
                         block_obj = self.angr.factory.block(block.addr, size=block.size)
                         for insn in block_obj.disassembly.insns:
-                            # Simple heuristic: look for address in operands
                             if insn.op_str and hex(addr) in insn.op_str:
                                 xref_type = "call" if "call" in insn.mnemonic.lower() else "data"
-                                xrefs.append(XRef(
-                                    from_addr=insn.address,
-                                    to_addr=addr,
-                                    xref_type=xref_type,
-                                    _manager=self,
-                                    _native=None
-                                ))
+                                xrefs.append(
+                                    XRef(
+                                        from_addr=insn.address,
+                                        to_addr=addr,
+                                        xref_type=xref_type,
+                                        _manager=self,
+                                        _native=None,
+                                    )
+                                )
                     except Exception:
                         continue
         except Exception:
             pass
-        
+
         return xrefs
-    
+
     def get_xrefs_from(self, addr: int) -> List[XRef]:
-        """Get xrefs from address."""
         xrefs = []
-        
+
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
-            
-            # Find the instruction at this address
+
             func = cfg.functions.floor_func(addr)
             if func:
                 for block in func.blocks:
@@ -280,22 +273,27 @@ class AngrXRefManager(XRefManager):
                             block_obj = self.angr.factory.block(block.addr, size=block.size)
                             for insn in block_obj.disassembly.insns:
                                 if insn.address == addr:
-                                    # Parse operands for addresses
                                     if insn.op_str:
-                                        # Simple heuristic for finding addresses
                                         import re
-                                        addr_matches = re.findall(r'0x[0-9a-fA-F]+', insn.op_str)
+
+                                        addr_matches = re.findall(r"0x[0-9a-fA-F]+", insn.op_str)
                                         for addr_str in addr_matches:
                                             try:
                                                 target_addr = int(addr_str, 16)
-                                                xref_type = "call" if "call" in insn.mnemonic.lower() else "data"
-                                                xrefs.append(XRef(
-                                                    from_addr=addr,
-                                                    to_addr=target_addr,
-                                                    xref_type=xref_type,
-                                                    _manager=self,
-                                                    _native=None
-                                                ))
+                                                xref_type = (
+                                                    "call"
+                                                    if "call" in insn.mnemonic.lower()
+                                                    else "data"
+                                                )
+                                                xrefs.append(
+                                                    XRef(
+                                                        from_addr=addr,
+                                                        to_addr=target_addr,
+                                                        xref_type=xref_type,
+                                                        _manager=self,
+                                                        _native=None,
+                                                    )
+                                                )
                                             except ValueError:
                                                 continue
                                     break
@@ -304,27 +302,23 @@ class AngrXRefManager(XRefManager):
                         break
         except Exception:
             pass
-        
+
         return xrefs
-    
-    def get_all_xrefs(self) -> List[XRef]:
-        """Get all xrefs."""
-        # This would be very expensive, return empty list
+
+    def all(self) -> List[XRef]:
         return []
-    
-    def get_call_graph(self) -> dict:
-        """Get call graph data."""
+
+    def call_graph(self) -> dict:
         call_graph = {}
-        
+
         try:
-            if not hasattr(self.angr, '_cfg'):
+            if not hasattr(self.angr, "_cfg"):
                 self.angr._cfg = self.angr.analyses.CFGFast()
-            
+
             cfg = self.angr._cfg
-            
+
             for func_addr, func in cfg.functions.items():
                 calls = []
-                # Get function calls from this function
                 for callsite in func.get_call_sites():
                     target = func.get_call_target(callsite)
                     if target:
@@ -332,49 +326,44 @@ class AngrXRefManager(XRefManager):
                 call_graph[func_addr] = calls
         except Exception:
             pass
-        
+
         return call_graph
-    
-    def get_data_flow(self, addr: int) -> dict:
-        """Get data flow information."""
-        # angr data flow analysis would be complex
+
+    def data_flow(self, addr: int) -> dict:
         return {"reads": [], "writes": [], "uses": []}
 
 
 class AngrSymbolManager(SymbolManager):
-    """angr symbol implementation."""
-    
     def __init__(self, angr_native, analyzer=None):
         self.angr = angr_native
         self._analyzer = analyzer
-    
-    def get_all(self) -> List[Symbol]:
-        """Get all symbols."""
+
+    def all(self) -> List[Symbol]:
         symbols = []
-        
+
         try:
-            # Get symbols from angr's loader
             for name, symbol in self.angr.loader.main_object.symbols_by_name.items():
                 if symbol.is_function:
                     symbol_type = "function"
                 else:
                     symbol_type = "data"
-                
-                symbols.append(Symbol(
-                    address=symbol.rebased_addr,
-                    name=name,
-                    symbol_type=symbol_type,
-                    size=symbol.size if hasattr(symbol, 'size') else None,
-                    _manager=self,
-                    _native=symbol
-                ))
+
+                symbols.append(
+                    Symbol(
+                        address=symbol.rebased_addr,
+                        name=name,
+                        symbol_type=symbol_type,
+                        size=symbol.size if hasattr(symbol, "size") else None,
+                        _manager=self,
+                        _native=symbol,
+                    )
+                )
         except Exception:
             pass
-        
+
         return symbols
-    
-    def get_by_address(self, addr: int) -> Optional[Symbol]:
-        """Get symbol at address."""
+
+    def by_address(self, addr: int) -> Optional[Symbol]:
         try:
             symbol = self.angr.loader.find_symbol(addr)
             if symbol:
@@ -383,17 +372,16 @@ class AngrSymbolManager(SymbolManager):
                     address=symbol.rebased_addr,
                     name=symbol.name,
                     symbol_type=symbol_type,
-                    size=symbol.size if hasattr(symbol, 'size') else None,
+                    size=symbol.size if hasattr(symbol, "size") else None,
                     _manager=self,
-                    _native=symbol
+                    _native=symbol,
                 )
         except Exception:
             pass
-        
+
         return None
-    
-    def get_by_name(self, name: str) -> Optional[Symbol]:
-        """Get symbol by name."""
+
+    def by_name(self, name: str) -> Optional[Symbol]:
         try:
             symbol = self.angr.loader.find_symbol(name)
             if symbol:
@@ -402,23 +390,19 @@ class AngrSymbolManager(SymbolManager):
                     address=symbol.rebased_addr,
                     name=symbol.name,
                     symbol_type=symbol_type,
-                    size=symbol.size if hasattr(symbol, 'size') else None,
+                    size=symbol.size if hasattr(symbol, "size") else None,
                     _manager=self,
-                    _native=symbol
+                    _native=symbol,
                 )
         except Exception:
             pass
-        
+
         return None
-    
-    def get_variables(self, scope: Optional[int] = None) -> List[Variable]:
-        """Get variables (optionally scoped to function)."""
-        # angr variable analysis would require complex analysis
+
+    def variables(self, scope: Optional[int] = None) -> List[Variable]:
         return []
-    
-    def get_types(self) -> List[Type]:
-        """Get type information."""
-        # Basic primitive types
+
+    def types(self) -> List[Type]:
         return [
             Type(name="char", size=1, kind="primitive"),
             Type(name="short", size=2, kind="primitive"),
@@ -428,66 +412,64 @@ class AngrSymbolManager(SymbolManager):
             Type(name="double", size=8, kind="primitive"),
             Type(name="void*", size=8, kind="primitive"),
         ]
-    
-    def get_strings(self) -> List[Symbol]:
-        """Get string literals."""
+
+    def strings(self) -> List[Symbol]:
         strings = []
-        
+
         try:
-            # Look for strings in the binary
             for section in self.angr.loader.main_object.sections:
                 if section.is_readable and not section.is_executable:
                     try:
                         data = self.angr.loader.memory.load(section.vaddr, section.memsize)
-                        # Simple string detection
                         current_string = b""
                         string_start = section.vaddr
-                        
+
                         for i, byte in enumerate(data):
                             if 32 <= byte <= 126:  # Printable ASCII
                                 current_string += bytes([byte])
                             else:
                                 if len(current_string) >= 4:  # Minimum string length
-                                    strings.append(Symbol(
-                                        address=string_start,
-                                        name=current_string.decode('ascii', errors='ignore'),
-                                        symbol_type="string",
-                                        size=len(current_string),
-                                        _manager=self,
-                                        _native=None
-                                    ))
+                                    strings.append(
+                                        Symbol(
+                                            address=string_start,
+                                            name=current_string.decode("ascii", errors="ignore"),
+                                            symbol_type="string",
+                                            size=len(current_string),
+                                            _manager=self,
+                                            _native=None,
+                                        )
+                                    )
                                 current_string = b""
                                 string_start = section.vaddr + i + 1
-                        
-                        # Handle string at end of section
+
                         if len(current_string) >= 4:
-                            strings.append(Symbol(
-                                address=string_start,
-                                name=current_string.decode('ascii', errors='ignore'),
-                                symbol_type="string",
-                                size=len(current_string),
-                                _manager=self,
-                                _native=None
-                            ))
+                            strings.append(
+                                Symbol(
+                                    address=string_start,
+                                    name=current_string.decode("ascii", errors="ignore"),
+                                    symbol_type="string",
+                                    size=len(current_string),
+                                    _manager=self,
+                                    _native=None,
+                                )
+                            )
                     except Exception:
                         continue
         except Exception:
             pass
-        
+
         return strings
 
 
+
 class AngrBinaryManager(BinaryManager):
-    """angr binary file format implementation."""
-    
     def __init__(self, angr_native, analyzer=None):
         self.angr = angr_native
         self._analyzer = analyzer
-    
-    def get_segments(self) -> List[dict]:
-        """Get memory segments."""
+
+    def segments(self) -> List[dict]:
         segments = []
-        
+
         try:
             for section in self.angr.loader.main_object.sections:
                 permissions = ""
@@ -497,94 +479,93 @@ class AngrBinaryManager(BinaryManager):
                     permissions += "w"
                 if section.is_executable:
                     permissions += "x"
-                
-                segments.append({
-                    "name": section.name,
-                    "start": section.vaddr,
-                    "end": section.vaddr + section.memsize,
-                    "size": section.memsize,
-                    "permissions": permissions
-                })
+
+                segments.append(
+                    {
+                        "name": section.name,
+                        "start": section.vaddr,
+                        "end": section.vaddr + section.memsize,
+                        "size": section.memsize,
+                        "permissions": permissions,
+                    }
+                )
         except Exception:
             pass
-        
+
         return segments
-    
-    def get_sections(self) -> List[dict]:
-        """Get file sections."""
-        return self.get_segments()  # Same as segments for angr
-    
-    def get_imports(self) -> List[Symbol]:
-        """Get imported functions/symbols."""
+
+    def sections(self) -> List[dict]:
+        return self.segments()  # Same as segments for angr
+
+    def imports(self) -> List[Symbol]:
         imports = []
-        
+
         try:
-            # Get PLT symbols (imports)
             for name, symbol in self.angr.loader.main_object.symbols_by_name.items():
                 if symbol.is_import:
-                    imports.append(Symbol(
-                        address=symbol.rebased_addr,
-                        name=name,
-                        symbol_type="import",
-                        _manager=None,
-                        _native=symbol
-                    ))
+                    imports.append(
+                        Symbol(
+                            address=symbol.rebased_addr,
+                            name=name,
+                            symbol_type="import",
+                            _manager=None,
+                            _native=symbol,
+                        )
+                    )
         except Exception:
             pass
-        
+
         return imports
-    
-    def get_exports(self) -> List[Symbol]:
-        """Get exported functions/symbols."""
+
+    def exports(self) -> List[Symbol]:
         exports = []
-        
+
         try:
-            # Get exported symbols
             for name, symbol in self.angr.loader.main_object.symbols_by_name.items():
                 if symbol.is_export:
-                    exports.append(Symbol(
-                        address=symbol.rebased_addr,
-                        name=name,
-                        symbol_type="export",
-                        _manager=None,
-                        _native=symbol
-                    ))
+                    exports.append(
+                        Symbol(
+                            address=symbol.rebased_addr,
+                            name=name,
+                            symbol_type="export",
+                            _manager=None,
+                            _native=symbol,
+                        )
+                    )
         except Exception:
             pass
-        
+
         return exports
-    
-    def get_entry_points(self) -> List[int]:
-        """Get program entry points."""
+
+    def entry_points(self) -> List[int]:
         try:
             return [self.angr.entry]
         except Exception:
             return []
-    
-    def get_file_info(self) -> dict:
-        """Get file format information."""
+
+    @property
+    def file_info(self) -> dict:
         try:
             main_obj = self.angr.loader.main_object
-            
-            # Map angr arch to readable names
+
             arch_map = {
-                'X86': 'x86',
-                'AMD64': 'x86_64',
-                'ARM': 'arm',
-                'AARCH64': 'aarch64',
-                'MIPS32': 'mips',
-                'MIPS64': 'mips64'
+                "X86": "x86",
+                "AMD64": "x86_64",
+                "ARM": "arm",
+                "AARCH64": "aarch64",
+                "MIPS32": "mips",
+                "MIPS64": "mips64",
             }
-            
+
             arch_name = arch_map.get(main_obj.arch.name, main_obj.arch.name.lower())
-            
+
             return {
                 "filename": main_obj.binary,
                 "filetype": main_obj.os,
                 "architecture": arch_name,
                 "bits": main_obj.arch.bits,
                 "endian": "big" if main_obj.arch.memory_endness == "Iend_BE" else "little",
-                "base_address": main_obj.min_addr
+                "base_address": main_obj.min_addr,
             }
         except Exception:
             return {
@@ -593,5 +574,174 @@ class AngrBinaryManager(BinaryManager):
                 "architecture": "unknown",
                 "bits": 32,
                 "endian": "little",
-                "base_address": 0
+                "base_address": 0,
             }
+
+    def strings(self) -> List[Symbol]:
+        if self._analyzer and hasattr(self._analyzer, "symbols"):
+            return self._analyzer.symbols.strings()
+        return []
+
+    def search_strings(self, pattern: str) -> List[Symbol]:
+        import re
+        all_strings = self.strings()
+        compiled_pattern = re.compile(pattern, re.IGNORECASE)
+        return [s for s in all_strings if compiled_pattern.search(s.name)]
+
+
+class AngrTypeManager(TypeManager):
+    def __init__(self, angr_native, analyzer=None):
+        self.angr = angr_native
+        self._analyzer = analyzer
+
+    def all(self) -> List[Type]:
+        return [
+            Type(name="char", size=1, kind="primitive"),
+            Type(name="short", size=2, kind="primitive"),
+            Type(name="int", size=4, kind="primitive"),
+            Type(name="long", size=8, kind="primitive"),
+            Type(name="float", size=4, kind="primitive"),
+            Type(name="double", size=8, kind="primitive"),
+            Type(name="void*", size=8, kind="primitive"),
+        ]
+
+    def by_name(self, name: str) -> Optional[Type]:
+        for t in self.all():
+            if t.name == name:
+                return t
+        return None
+
+    def function_signature(self, addr: int) -> Optional[Type]:
+        return None
+
+    def primitive_types(self) -> List[Type]:
+        return self.all()
+
+    def user_types(self) -> List[Type]:
+        return []
+
+
+
+class AngrArchitectureManager(ArchitectureManager):
+    def __init__(self, angr_native, analyzer=None):
+        self.angr = angr_native
+        self._analyzer = analyzer
+
+    @property
+    def name(self) -> str:
+        try:
+            main_obj = self.angr.loader.main_object
+            arch_map = {
+                "X86": "x86",
+                "AMD64": "x86_64",
+                "ARM": "arm",
+                "AARCH64": "aarch64",
+                "MIPS32": "mips",
+                "MIPS64": "mips64",
+            }
+            return arch_map.get(main_obj.arch.name, main_obj.arch.name.lower())
+        except Exception:
+            return "unknown"
+
+    @property
+    def bits(self) -> int:
+        try:
+            return self.angr.loader.main_object.arch.bits
+        except Exception:
+            return 32
+
+    @property
+    def endian(self) -> str:
+        try:
+            main_obj = self.angr.loader.main_object
+            return "big" if main_obj.arch.memory_endness == "Iend_BE" else "little"
+        except Exception:
+            return "little"
+
+    def registers(self) -> List[str]:
+        try:
+            arch = self.angr.loader.main_object.arch
+            return list(arch.registers.keys()) if hasattr(arch, "registers") else []
+        except Exception:
+            return []
+
+    def get_register_info(self, name: str) -> Optional[dict]:
+        try:
+            arch = self.angr.loader.main_object.arch
+            if hasattr(arch, "registers") and name in arch.registers:
+                reg = arch.registers[name]
+                return {"offset": reg[0], "size": reg[1]}
+        except Exception:
+            pass
+        return None
+
+    def calling_convention(self) -> Optional[str]:
+        try:
+            arch = self.angr.loader.main_object.arch
+            return getattr(arch, "calling_convention", None)
+        except Exception:
+            return None
+
+
+class AngrMemoryManager(MemoryManager):
+    def __init__(self, angr_native, analyzer=None):
+        self.angr = angr_native
+        self._analyzer = analyzer
+
+    @property
+    def base_address(self) -> int:
+        try:
+            return self.angr.loader.main_object.min_addr
+        except Exception:
+            return 0
+
+    def read(self, addr: int, size: int) -> Optional[bytes]:
+        try:
+            return self.angr.loader.memory.load(addr, size)
+        except Exception:
+            return None
+
+    def read_string(self, addr: int, max_length: int = 1024) -> Optional[str]:
+        try:
+            data = self.angr.loader.memory.load(addr, max_length)
+            # Find null terminator
+            null_pos = data.find(b'\x00')
+            if null_pos != -1:
+                data = data[:null_pos]
+            return data.decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+
+    def read_pointer(self, addr: int) -> Optional[int]:
+        try:
+            arch = self.angr.loader.main_object.arch
+            ptr_size = arch.bits // 8
+            data = self.angr.loader.memory.load(addr, ptr_size)
+            if arch.memory_endness == "Iend_BE":
+                return int.from_bytes(data, 'big')
+            else:
+                return int.from_bytes(data, 'little')
+        except Exception:
+            return None
+
+    def is_valid_address(self, addr: int) -> bool:
+        try:
+            return self.angr.loader.main_object.contains_addr(addr)
+        except Exception:
+            return False
+
+    def permissions(self, addr: int) -> Optional[str]:
+        try:
+            for section in self.angr.loader.main_object.sections:
+                if section.vaddr <= addr < section.vaddr + section.memsize:
+                    perms = ""
+                    if section.is_readable:
+                        perms += "r"
+                    if section.is_writable:
+                        perms += "w"
+                    if section.is_executable:
+                        perms += "x"
+                    return perms
+        except Exception:
+            pass
+        return None
