@@ -1,196 +1,200 @@
-"""Smart analysis CLI that dynamically reads manager methods."""
-
-import ludi
 import inspect
-from ..decompilers.base.managers import FunctionManager, SymbolManager, XRefManager, BinaryManager
+
+# Import will be done lazily to avoid circular import
 
 
 class AnalyzeCLI:
-    """CLI that dynamically exposes all manager methods."""
-    
     def __init__(self):
-        self.analyzer = None
+        self.backend = None
         self.manager_classes = self._discover_managers()
-    
+
     def _discover_managers(self):
-        """Automatically discover manager classes from all supported backends."""
         import inspect
-        from ..ludi import LUDI, SUPPORTED_BACKENDS
-        
+
+        from ..core.ludi import SUPPORTED_BACKENDS
+        from ..backends.base.decompiler import DecompilerBase
+
         manager_classes = {}
-        
-        # First get base managers from LUDI class
-        for name, prop in inspect.getmembers(LUDI, lambda x: isinstance(x, property)):
-            if prop.__doc__ and ('manager' in prop.__doc__.lower() or 'access' in prop.__doc__.lower()):
-                if hasattr(prop.fget, '__annotations__') and 'return' in prop.fget.__annotations__:
-                    manager_class = prop.fget.__annotations__['return']
-                    manager_classes[name] = manager_class
-        
-        # Try to discover backend-specific managers from all supported backends
-        for backend_name, backend_class in SUPPORTED_BACKENDS.items():
+
+        # Discover managers from the base decompiler class
+        for name, prop in inspect.getmembers(
+            DecompilerBase, lambda x: isinstance(x, property)
+        ):
+            if (
+                hasattr(prop.fget, "__annotations__")
+                and "return" in prop.fget.__annotations__
+            ):
+                manager_class = prop.fget.__annotations__["return"]
+                manager_classes[name] = manager_class
+
+        for _backend_name, backend_class in SUPPORTED_BACKENDS.items():
             try:
-                # Get all manager properties from this backend
-                for name, prop in inspect.getmembers(backend_class, lambda x: isinstance(x, property)):
-                    if name not in manager_classes and name not in ['native']:
-                        # This is a potential manager not in the base LUDI class
-                        manager_classes[name] = None  # We'll resolve this later
-                        
-                # Also check for any methods that might indicate additional functionality
-                backend_methods = [name for name in dir(backend_class) if not name.startswith('_')]
-                backend_manager_attrs = [name for name in backend_methods if name.endswith('_manager')]
-                
+                for name, _prop in inspect.getmembers(
+                    backend_class, lambda x: isinstance(x, property)
+                ):
+                    if name not in manager_classes and name not in ["native"]:
+                        manager_classes[name] = None
+
+                backend_methods = [
+                    name for name in dir(backend_class) if not name.startswith("_")
+                ]
+                backend_manager_attrs = [
+                    name for name in backend_methods if name.endswith("_manager")
+                ]
+
                 for attr_name in backend_manager_attrs:
-                    manager_name = attr_name.replace('_manager', '')
+                    manager_name = attr_name.replace("_manager", "")
                     if manager_name not in manager_classes:
-                        # Try to get the manager class from the attribute
                         try:
                             attr = getattr(backend_class, attr_name, None)
-                            if attr and hasattr(attr, '__annotations__'):
-                                manager_classes[manager_name] = attr.__annotations__.get('return')
-                        except:
+                            if attr and hasattr(attr, "__annotations__"):
+                                manager_classes[
+                                    manager_name
+                                ] = attr.__annotations__.get("return")
+                        except AttributeError:
                             pass
-                            
+
             except Exception:
-                # Skip backends that can't be inspected
                 continue
-        
-        # Fallback to hardcoded if discovery fails completely
+
+        # Import actual manager classes to replace string annotations
+        try:
+            from ..backends.base.managers import (
+                FunctionManager,
+                SymbolManager,
+                XRefManager,
+                BinaryManager,
+                TypeManager,
+                MemoryManager,
+                ArchitectureManager,
+            )
+
+            # Replace string annotations with actual classes
+            class_mapping = {
+                "FunctionManager": FunctionManager,
+                "SymbolManager": SymbolManager,
+                "XRefManager": XRefManager,
+                "BinaryManager": BinaryManager,
+                "TypeManager": TypeManager,
+                "MemoryManager": MemoryManager,
+                "ArchitectureManager": ArchitectureManager,
+            }
+
+            for name, cls in manager_classes.items():
+                if isinstance(cls, str) and cls in class_mapping:
+                    manager_classes[name] = class_mapping[cls]
+
+        except ImportError:
+            pass
+
         if not manager_classes:
             manager_classes = {
-                'functions': FunctionManager,
-                'symbols': SymbolManager, 
-                'xrefs': XRefManager,
-                'binary': BinaryManager
+                "functions": FunctionManager,
+                "symbols": SymbolManager,
+                "xrefs": XRefManager,
+                "binary": BinaryManager,
             }
-        
-        # Remove None values (failed discoveries)
+
         manager_classes = {k: v for k, v in manager_classes.items() if v is not None}
-        
+
         return manager_classes
-    
-    def get_runtime_methods(self, manager_name, backend=None):
-        """Get methods available at runtime for a specific backend."""
-        if not self.analyzer:
-            # Use base class methods if no analyzer loaded
+
+    def get_runtime_methods(self, manager_name, backend_config=None):
+        if not self.backend:
             if manager_name in self.manager_classes:
                 base_class = self.manager_classes[manager_name]
-                return [name for name in dir(base_class) 
-                       if not name.startswith('_') and callable(getattr(base_class, name, None))]
+                return [
+                    name
+                    for name in dir(base_class)
+                    if not name.startswith("_")
+                    and callable(getattr(base_class, name, None))
+                ]
             return []
-        
-        # Get actual methods from loaded analyzer's manager
+
         try:
-            manager = getattr(self.analyzer, manager_name)
-            methods = [name for name in dir(manager) 
-                      if not name.startswith('_') and callable(getattr(manager, name))]
+            manager = getattr(self.backend, manager_name)
+            methods = [
+                name
+                for name in dir(manager)
+                if not name.startswith("_") and callable(getattr(manager, name))
+            ]
             return methods
         except AttributeError:
             return []
-    
-    def init_analyzer(self, binary_path, backend=None):
-        """Initialize analyzer with optional backend selection."""
-        if not self.analyzer:
-            if backend:
-                self.analyzer = ludi.LUDI(backend, binary_path)
+
+    def init_backend(self, binary_path, backend_config=None):
+        if not self.backend:
+            from .. import analyze
+
+            if backend_config:
+                self.backend = analyze(binary_path, backend=backend_config)
             else:
-                self.analyzer = ludi.auto(binary_path)
-    
+                self.backend = analyze(binary_path)
+
     def handle_command(self, args):
-        """Route commands to manager methods."""
-        backend = getattr(args, 'backend', None)
-        self.init_analyzer(args.binary, backend)
-        
-        # Get the manager
+        backend_config = getattr(args, "backend", None)
+        self.init_backend(args.binary, backend_config)
+
         manager_name = args.analyze_command
-        manager = getattr(self.analyzer, manager_name)
-        
-        # Get the method
-        method_name = getattr(args, f'{manager_name}_action', None)
+        manager = getattr(self.backend, manager_name)
+
+        method_name = getattr(args, f"{manager_name}_action", None)
         if not method_name:
-            # Show available methods for this manager
             self._show_manager_methods(manager, manager_name)
             return
-            
+
         method = getattr(manager, method_name)
-        
-        # Get method arguments from CLI args
+
         method_args = self._extract_method_args(method, args)
-        
-        # Call the method
+
         result = method(**method_args)
-        
-        # Display result
+
         self._display_result(result, method_name)
-    
+
     def _extract_method_args(self, method, args):
-        """Extract method arguments from CLI args."""
         sig = inspect.signature(method)
         method_args = {}
-        
+
         for param_name in sig.parameters:
-            if param_name == 'self':
+            if param_name == "self":
                 continue
             if hasattr(args, param_name):
                 value = getattr(args, param_name)
-                # Handle optional parameters that are None
                 if value is not None:
                     method_args[param_name] = value
-        
+
         return method_args
-    
+
     def _display_result(self, result, method_name):
-        """Display method result."""
-        if result is None:
-            print("None")
-        elif isinstance(result, (list, tuple)):
-            if not result:
-                print("[]")
-            else:
-                for item in result:
-                    self._display_item(item)
-        else:
-            self._display_item(result)
-    
-    def _display_item(self, item):
-        """Display a single item."""
-        if hasattr(item, 'name') and hasattr(item, 'start'):
-            # Function-like object
-            print(f"{item.name or 'unnamed'} @ 0x{item.start:x}")
-        elif hasattr(item, 'name') and hasattr(item, 'address'):
-            # Symbol-like object
-            print(f"{item.name} @ 0x{item.address:x}")
-        elif hasattr(item, 'from_addr') and hasattr(item, 'to_addr'):
-            # XRef-like object
-            print(f"0x{item.from_addr:x} -> 0x{item.to_addr:x} ({item.xref_type})")
-        elif isinstance(item, dict):
-            # Dict result (like segments, sections)
-            formatted = ', '.join(f"{k}: {v}" for k, v in item.items())
-            print(f"{{{formatted}}}")
-        else:
-            print(str(item))
-    
+        from ..core.utils import display_result
+
+        display_result(result)
+
     def _show_manager_methods(self, manager, manager_name):
-        """Show available methods for a manager."""
         print(f"Available {manager_name} methods:")
-        
-        # Get methods from the base manager class to show the API
+
         base_class = self.manager_classes[manager_name]
         methods = []
-        
+
+        # Get manager property names to exclude (dynamic discovery)
+        excluded_names = set(self.manager_classes.keys())
+        excluded_names.add("variables")  # Legacy exclusion
+
         for name in dir(base_class):
-            if not name.startswith('_') and name not in ['functions', 'symbols', 'xrefs', 'variables']:
+            if not name.startswith("_") and name not in excluded_names:
                 attr = getattr(base_class, name)
-                if callable(attr) and hasattr(attr, '__isabstractmethod__'):
+                if callable(attr) and hasattr(attr, "__isabstractmethod__"):
                     methods.append(name)
-        
-        # Also get non-abstract methods
+
         for name in dir(manager):
-            if (not name.startswith('_') and 
-                name not in ['functions', 'symbols', 'xrefs', 'variables'] and
-                callable(getattr(manager, name)) and
-                name not in methods):
+            if (
+                not name.startswith("_")
+                and name not in excluded_names
+                and callable(getattr(manager, name))
+                and name not in methods
+            ):
                 methods.append(name)
-        
+
         methods.sort()
         for method_name in methods:
             try:
@@ -198,61 +202,62 @@ class AnalyzeCLI:
                 sig = inspect.signature(method_obj)
                 params = []
                 for param_name, param in sig.parameters.items():
-                    if param_name == 'self':
+                    if param_name == "self":
                         continue
                     if param.default == inspect.Parameter.empty:
                         params.append(param_name)
                     else:
                         params.append(f"{param_name}={param.default}")
-                param_str = ', '.join(params) if params else ''
+                param_str = ", ".join(params) if params else ""
                 print(f"  {method_name}({param_str})")
-            except:
+            except (AttributeError, TypeError):
                 print(f"  {method_name}(...)")
-    
+
     def _add_method_parsers(self, subparsers, manager_name, manager_class):
-        """Dynamically add parsers for all methods in a manager."""
-        # Get all abstract methods from base class
+        # Get manager property names to exclude (dynamic discovery)
+        excluded_names = set(self.manager_classes.keys())
+        excluded_names.add("variables")  # Legacy exclusion
+
         methods = []
         for name in dir(manager_class):
-            if not name.startswith('_') and name not in ['functions', 'symbols', 'xrefs', 'variables']:
+            if not name.startswith("_") and name not in excluded_names:
                 attr = getattr(manager_class, name)
-                if callable(attr):
+                if callable(attr) and hasattr(attr, "__isabstractmethod__"):
                     methods.append((name, attr))
-        
+
         for method_name, method in methods:
             try:
                 sig = inspect.signature(method)
-                parser = subparsers.add_parser(method_name, help=f"{method.__doc__ or method_name}")
-                
+                parser = subparsers.add_parser(
+                    method_name, help=f"{method.__doc__ or method_name}"
+                )
+
                 for param_name, param in sig.parameters.items():
-                    if param_name == 'self':
+                    if param_name == "self":
                         continue
-                    
-                    # Determine argument type and setup
-                    if param.annotation == int or 'addr' in param_name.lower():
+
+                    if param.annotation == int or "addr" in param_name.lower():
                         parser.add_argument(
-                            param_name, 
-                            type=lambda x: int(x, 16) if x.startswith('0x') else int(x),
-                            help=f"{param_name} (address)"
+                            param_name,
+                            type=lambda x: int(x, 16) if x.startswith("0x") else int(x),
+                            help=f"{param_name} (address)",
                         )
                     elif param.default == inspect.Parameter.empty:
-                        # Required parameter
                         parser.add_argument(param_name, help=param_name)
                     else:
-                        # Optional parameter
-                        parser.add_argument(f'--{param_name}', default=param.default, help=param_name)
-            except Exception as e:
-                # Skip methods we can't introspect
+                        parser.add_argument(
+                            f"--{param_name}", default=param.default, help=param_name
+                        )
+            except Exception:
                 continue
-    
+
     def add_parsers(self, subparsers):
-        """Dynamically add analysis subcommands for all managers."""
-        # Add backend selection to main analyze parser
-        
-        # Dynamically create parsers for each manager
         for manager_name, manager_class in self.manager_classes.items():
-            manager_parser = subparsers.add_parser(manager_name, help=f'{manager_name.title()} manager methods')
-            manager_sub = manager_parser.add_subparsers(dest=f'{manager_name}_action', help=f'{manager_name.title()} methods')
-            
-            # Add methods for this manager
+            manager_parser = subparsers.add_parser(
+                manager_name, help=f"{manager_name.title()} manager methods"
+            )
+            manager_sub = manager_parser.add_subparsers(
+                dest=f"{manager_name}_action", help=f"{manager_name.title()} methods"
+            )
+
             self._add_method_parsers(manager_sub, manager_name, manager_class)

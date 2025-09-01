@@ -13,35 +13,66 @@ LUDI provides a unified interface for reverse engineering tools including IDA Pr
 > [!WARNING]
 > This project is in **very early development**. APIs may **change significantly** before version 1.0.0. The codebase currently **contains AI-generated code** that is **not yet fully reviewed**. Version 1.0.0 will be fully reviewed and stable.
 
-## Quick Start
+## Installation
 
 ```bash
-pip install ludi
-
-# Analyze with auto-detected backend
-ludi /bin/ls functions get_all
-
-# Use specific backend  
-ludi --backend ida /bin/ls functions get_decompiled_code main
-
-# Interactive shell
-ludi shell
+pip install ludi                    # Core only
+pip install ludi[all]               # All backends
 ```
 
+## Quick Start
+
+### CLI
+```bash
+ludi analyze /bin/ls                # Auto-select backend
+ludi analyze --backend ida /bin/ls  # Use specific backend
+ludi shell                          # Interactive shell
+ludi config show                    # Show configuration
+```
+
+### Python API
 ```python
 import ludi
 
-analyzer = ludi.auto("/path/to/binary")
+# Simple analysis
+analyzer = ludi.analyze("/bin/ls")  # Auto-select best backend
+# OR
+analyzer = ludi.ida("/bin/ls")      # Use specific backend
+# OR
+analyzer = ludi.analyze("/bin/ls", backend="ida-local")  # Use named config
+```
 
-# Simple, clean iteration
+### Usage
+
+```python
+# Unified API across all backends
 for func in analyzer.functions:
-    print(func.name, hex(func.start))
+    print(f"{func.name}: {hex(func.start)}")
+    print(analyzer.functions.decompiled_code(func.start))
 
-for symbol in analyzer.symbols:
-    print(symbol.name)
+# Access managers
+analyzer.functions      # Function analysis
+analyzer.symbols        # Symbol information
+analyzer.xrefs          # Cross-references
+analyzer.binary         # Binary metadata
+analyzer.types          # Type information
+analyzer.architecture   # CPU architecture
+analyzer.memory         # Memory operations
+```
 
-for xref in analyzer.xrefs:
-    print(hex(xref.from_addr), "->", hex(xref.to_addr))
+## Configuration
+
+LUDI uses named configurations in `~/.config/ludi/config.yaml`:
+
+```yaml
+ida-local:
+  type: ida
+  path: /opt/ida-pro/
+  enabled: true
+
+angr:
+  type: angr
+  autodiscover: true
 ```
 
 ## Contributing

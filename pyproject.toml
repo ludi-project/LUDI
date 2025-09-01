@@ -5,10 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ludi"
 dependencies = [
+    "pyyaml>=6.0"
+]
+
+[project.optional-dependencies]
+ida = ["headless-ida"]
+angr = ["angr"]
+ghidra = ["pyhidra"]
+all = [
     "headless-ida",
-    "angr",
-    "pyhidra",
-    "pyyaml"
+    "angr", 
+    "pyhidra"
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "mypy",
+    "types-PyYAML",
+    "build"
 ]
 readme = "README.md"
 description = "Ludi Unifies Decompiler Interfaces"
@@ -16,8 +33,24 @@ authors = [
     {name = "Han Dai", email = "pypi@han.do"},
 ]
 license = {file = "LICENSE"}
-requires-python = ">=3"
+requires-python = ">=3.8"
 dynamic = ["version"]
+keywords = ["reverse-engineering", "decompiler", "ida", "ghidra", "angr", "binary-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License", 
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Software Distribution",
+    "Topic :: Security"
+]
 
 [project.scripts]
 ludi = "ludi.cli.main:main"

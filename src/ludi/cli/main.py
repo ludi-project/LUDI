@@ -1,483 +1,583 @@
-import sys
 import argparse
 import os
-import subprocess
+import sys
 from pathlib import Path
+
+# Import removed to avoid circular import - will import when needed
+from ..assets import get_banner, get_title
+from ..logger import get_logger, setup_logging
 from .config import ConfigCLI
-from .analyze import AnalyzeCLI
-import ludi
-from ..assets import LUDI_ASCII_BANNER, LUDI_TEXT_BANNER
+
+logger = get_logger("cli.main")
 
 try:
     import readline
+
     READLINE_AVAILABLE = True
 except ImportError:
     READLINE_AVAILABLE = False
 
 
 def _display_ascii_art():
-    """Display LUDI ASCII art banner."""
-    try:
-        # Try to display colored ASCII art
-        print(LUDI_ASCII_BANNER)
-    except Exception:
-        # If anything goes wrong, show the plain text version
-        print(LUDI_TEXT_BANNER)
+    print(get_banner())
+
+
+def _expand_shorthand(args, parser):
+    """Expand shorthand commands if unambiguous."""
+    if not args or args[0].startswith("-"):
+        return args
+
+    command = args[0]
+
+    # Get all available commands from subparsers
+    choices = []
+    for action in parser._actions:
+        if hasattr(action, "choices") and action.choices:
+            choices = list(action.choices.keys())
+            break
+
+    if not choices:
+        return args
+
+    # Find exact match first
+    if command in choices:
+        return args
+
+    # Find prefix matches
+    matches = [cmd for cmd in choices if cmd.startswith(command)]
+
+    if len(matches) == 1:
+        # Unambiguous shorthand - expand it
+        new_args = [matches[0]] + args[1:]
+        logger.debug(f"Expanded '{command}' to '{matches[0]}'")
+        return new_args
+    elif len(matches) > 1:
+        # Ambiguous shorthand - let argparse handle the error
+        return args
+    else:
+        # No matches - let argparse handle the error
+        return args
+
+
+def _setup_command_parser(parser):
+    """Setup parser by discovering commands from ludi.core."""
+    from ..core import discover_commands
+    from ..core.utils import get_config_manager
+
+    config_manager = get_config_manager()
+    available_backends = list(config_manager.load_config().keys())
+
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose output"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--config", help="Path to config file (default: ~/.config/ludi/config.yaml)"
+    )
+
+    # Discover and add commands dynamically
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    commands = discover_commands()
+
+    for command_name, command_module_or_class in commands.items():
+        if command_name == "analyze":
+            _add_analyze_command(
+                subparsers, command_module_or_class, available_backends
+            )
+        elif command_name == "config":
+            _add_config_command(subparsers, command_module_or_class, parser)
+        else:
+            # Generic command handler for future commands
+            _add_generic_command(subparsers, command_name, command_module_or_class)
+
+    # Add remaining non-dynamic commands (these could be moved to commands/ later)
+    _add_remaining_commands(subparsers, parser)
+
+
+def _add_analyze_command(subparsers, analyze_module, available_backends):
+    """Add analyze command based on discovered module."""
+    import inspect
+
+    analyze_func = getattr(analyze_module, "analyze")
+    doc = inspect.getdoc(analyze_func) or "Analyze a binary file"
+
+    analyze_parser = subparsers.add_parser("analyze", help=doc.split("\n")[0])
+
+    # Add binary argument first
+    analyze_parser.add_argument("binary", help="Binary file to analyze")
+    analyze_parser.add_argument(
+        "--backend",
+        choices=available_backends,
+        help="Backend to use (default: auto-detect)",
+    )
+
+    # Add subcommands for analyze (optional - show help when no action specified)
+    analyze_subparsers = analyze_parser.add_subparsers(
+        dest="analyze_action", help="Analysis actions", required=False
+    )
+
+    # Add shell subcommand
+    analyze_subparsers.add_parser(
+        "shell", help="Start interactive shell for binary analysis"
+    )
+
+    # Add manager subcommands
+    from ..cli.analyze import AnalyzeCLI
+
+    analyze_cli = AnalyzeCLI()
+
+    for manager_name, manager_class in analyze_cli.manager_classes.items():
+        # Filter out non-manager classes like 'backend_name' which is just str
+        if (
+            manager_class
+            and manager_name not in ["backend_name"]
+            and manager_class != str
+        ):
+            manager_parser = analyze_subparsers.add_parser(
+                manager_name, help=f"Access {manager_name} manager methods"
+            )
+            manager_sub = manager_parser.add_subparsers(
+                dest=f"{manager_name}_action",
+                help=f"{manager_name} methods",
+                required=False,
+            )
+            analyze_cli._add_method_parsers(manager_sub, manager_name, manager_class)
+
+
+def _add_config_command(subparsers, config_class, parser):
+    """Add config command group based on discovered class."""
+    import inspect
+
+    config_parser = subparsers.add_parser("config", help="Configuration management")
+    parser._config_parser = config_parser  # Store reference
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+
+    # Inspect config class methods
+    config_instance = config_class()
+    for method_name in dir(config_instance):
+        if method_name.startswith("_"):
+            continue
+
+        method = getattr(config_instance, method_name)
+        if not callable(method):
+            continue
+
+        sig = inspect.signature(method)
+        doc = inspect.getdoc(method) or f"{method_name} command"
+
+        method_parser = config_subparsers.add_parser(
+            method_name, help=doc.split("\n")[0]
+        )
+
+        # Add arguments based on method signature
+        for param_name, param in sig.parameters.items():
+            if param_name == "self":
+                continue
+
+            if param.annotation == bool:
+                method_parser.add_argument(
+                    f"--{param_name.replace('_', '-')}",
+                    action="store_true",
+                    help=f"{param_name} flag",
+                )
+            elif param.default is not inspect.Parameter.empty:
+                method_parser.add_argument(
+                    f"--{param_name.replace('_', '-')}"
+                    if param.default is not None
+                    else param_name,
+                    default=param.default,
+                    help=f"{param_name} parameter",
+                )
+            else:
+                method_parser.add_argument(param_name, help=f"{param_name} parameter")
+
+
+def _add_generic_command(subparsers, command_name, command_module):
+    """Add a generic command based on discovered module."""
+    # For future extensibility
+    pass
+
+
+def _add_remaining_commands(subparsers, parser):
+    """Add commands that haven't been moved to ludi.commands yet."""
+    # Shell command
+    subparsers.add_parser("shell", help="Interactive LUDI shell")
+
+    # Server command
+    server_parser = subparsers.add_parser("server", help="Run LUDI server")
+    server_parser.add_argument("--host", default="localhost", help="Host to bind to")
+    server_parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
+
+    # Completion command
+    completion_parser = subparsers.add_parser(
+        "completion", help="Generate completion scripts"
+    )
+    completion_parser.add_argument(
+        "shell", choices=["bash", "zsh", "fish"], help="Shell type"
+    )
+
+    # Native command
+    native_parser = subparsers.add_parser("native", help="Run native backend scripts")
+    parser._native_parser = native_parser  # Store reference for later use
+    native_subparsers = native_parser.add_subparsers(dest="native_action")
+    run_parser = native_subparsers.add_parser("run", help="Run a native script")
+    run_parser.add_argument("script", help="Script to run")
+    run_parser.add_argument("args", nargs="*", help="Script arguments")
 
 
 def _resolve_backend_and_binary(args):
-    """Resolve backend and binary with fallback hierarchy: CLI > env > config > auto-discovery."""
     backend = None
     binary = None
-    
-    # 1. CLI arguments (highest priority)
-    if hasattr(args, 'backend') and args.backend:
+
+    if hasattr(args, "backend") and args.backend:
         backend = args.backend
-    if hasattr(args, 'binary') and args.binary:
+    if hasattr(args, "binary") and args.binary:
         binary = args.binary
-    
-    # 2. Environment variables
+
     if not backend:
-        backend = os.environ.get('LUDI_BACKEND')
+        backend = os.environ.get("LUDI_BACKEND")
     if not binary:
-        binary = os.environ.get('LUDI_BINARY')
-    
-    # 3. Configuration file
+        binary = os.environ.get("LUDI_BINARY")
+
     if not backend:
         try:
             from .config import ConfigCLI
-            config_cli = ConfigCLI()
-            # Try to get default backend from config (this would need to be implemented)
-            # For now, we'll skip this step
-        except:
+
+            ConfigCLI()
+        except ImportError:
             pass
-    
-    # 4. Auto-discovery (find first available backend)
+
     if not backend:
         try:
-            from ludi.decompilers.base.config import get_config_manager
+            from ..core.utils import get_config_manager
+
             config_manager = get_config_manager()
-            providers = config_manager.get_providers()
-            
-            for provider in providers:
-                if provider.auto_discover():
-                    backend = provider.backend_name
+            backends = config_manager.get_backends()
+
+            for backend_wrapper in backends:
+                discovered = backend_wrapper.auto_discover()
+                if discovered and "path" in discovered:
+                    backend = backend_wrapper.backend_name
                     break
-        except:
-            # Fallback to angr as it's most commonly available
-            backend = 'angr'
-    
+        except (ImportError, AttributeError):
+            from ..core.utils import get_config_manager
+
+            config_manager = get_config_manager()
+            available = config_manager.get_available_backend_configs()
+            backend = available[0] if available else None
+            if not backend:
+                logger.error("No backends available. Run 'ludi config discover' first.")
+                print(
+                    "Error: No backends available. Run 'ludi config discover' first.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
     return backend, binary
 
 
-def _run_native_script(backend: str, script_path: str, binary_path: str = None, script_args: list = None):
-    """Run a native script using the specified backend."""
+def _run_native_script(
+    backend: str, script_path: str, binary_path: str = None, script_args: list = None
+):
     script_args = script_args or []
-    
-    # Validate script file exists
+
     if not os.path.exists(script_path):
+        logger.error(f"Script file not found: {script_path}")
         print(f"Error: Script file '{script_path}' not found", file=sys.stderr)
         sys.exit(1)
-    
-    # Validate binary file exists if provided
+
     if binary_path and not os.path.exists(binary_path):
+        logger.error(f"Binary file not found: {binary_path}")
         print(f"Error: Binary file '{binary_path}' not found", file=sys.stderr)
         sys.exit(1)
-    
+
     script_path = os.path.abspath(script_path)
     if binary_path:
         binary_path = os.path.abspath(binary_path)
-    
+
     print(f"Running native {backend} script: {script_path}")
     if binary_path:
         print(f"Target binary: {binary_path}")
     if script_args:
         print(f"Script arguments: {' '.join(script_args)}")
     print()
-    
+
     try:
-        if backend == 'ida':
-            _run_ida_script(script_path, binary_path, script_args)
-        elif backend == 'ghidra':
-            _run_ghidra_script(script_path, binary_path, script_args)
-        elif backend == 'angr':
-            _run_angr_script(script_path, binary_path, script_args)
+        from ..core.utils import get_config_manager
+
+        config_manager = get_config_manager()
+
+        if backend in config_manager._backends:
+            backend_wrapper = config_manager._backends[backend]
+            backend_wrapper.run_script(script_path, binary_path, script_args)
         else:
-            print(f"Error: Unsupported backend '{backend}'", file=sys.stderr)
+            print(
+                f"Error: Script execution not supported for backend '{backend}'",
+                file=sys.stderr,
+            )
             sys.exit(1)
     except Exception as e:
         print(f"Error running {backend} script: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def _run_ida_script(script_path: str, binary_path: str = None, script_args: list = None):
-    """Run IDA Python script using IDA."""
-    from ludi.decompilers.ida.config import get_ida_config
-    
-    config = get_ida_config()
-    if not config.path:
-        raise ValueError("IDA path not configured. Run 'ludi config discover' or set LUDI_IDA_PATH")
-    
-    ida_executable = None
-    # Find appropriate IDA executable
-    ida_dir = Path(config.path)
-    for ida_exe in ['idat64', 'idat', 'ida64', 'ida']:
-        exe_path = ida_dir / ida_exe
-        if exe_path.exists():
-            ida_executable = str(exe_path)
-            break
-    
-    if not ida_executable:
-        raise ValueError(f"Could not find IDA executable in {ida_dir}")
-    
-    # Build IDA command
-    cmd = [ida_executable, '-A']  # Auto-analyze
-    
-    if binary_path:
-        cmd.append(binary_path)
-    else:
-        # Create a dummy database if no binary specified
-        cmd.extend(['-o/dev/null'])
-    
-    # Add script
-    cmd.extend(['-S', script_path])
-    
-    # Add script arguments if any
-    if script_args:
-        # IDA passes additional args to scripts via sys.argv
-        cmd.extend(script_args)
-    
-    print(f"Executing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=False)
-    sys.exit(result.returncode)
-
-
-def _run_ghidra_script(script_path: str, binary_path: str = None, script_args: list = None):
-    """Run Ghidra script using headless analyzer."""
-    from ludi.decompilers.ghidra.config import get_ghidra_config
-    
-    config = get_ghidra_config()
-    if not config.headless_path:
-        raise ValueError("Ghidra path not configured. Run 'ludi config discover' or set LUDI_GHIDRA_PATH")
-    
-    # Create temporary project
-    import tempfile
-    with tempfile.TemporaryDirectory() as temp_dir:
-        project_dir = os.path.join(temp_dir, 'ghidra_project')
-        
-        cmd = [config.headless_path, project_dir, 'temp_project']
-        
-        if binary_path:
-            cmd.extend(['-import', binary_path])
-        else:
-            cmd.append('-process')  # Process without import
-        
-        # Add script
-        cmd.extend(['-postScript', script_path])
-        
-        # Add script arguments
-        if script_args:
-            cmd.extend(script_args)
-        
-        print(f"Executing: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False)
-        sys.exit(result.returncode)
-
-
-def _run_angr_script(script_path: str, binary_path: str = None, script_args: list = None):
-    """Run angr script in Python environment."""
-    import sys
-    import subprocess
-    
-    # Build Python command to run the script
-    cmd = [sys.executable, script_path]
-    
-    # Set environment variables
-    env = os.environ.copy()
-    
-    # Pass binary path as environment variable if provided
-    if binary_path:
-        env['LUDI_BINARY_PATH'] = binary_path
-    
-    # Pass script arguments
-    if script_args:
-        cmd.extend(script_args)
-    
-    # Add angr to Python path by ensuring ludi is available
-    # (since angr scripts will typically import angr)
-    print(f"Executing: {' '.join(cmd)}")
-    if binary_path:
-        print(f"Binary available via environment variable: LUDI_BINARY_PATH={binary_path}")
-    
-    result = subprocess.run(cmd, env=env, capture_output=False)
-    sys.exit(result.returncode)
-
-
 def main():
-    """Main CLI entry point."""
-    # Handle hidden completion command first
-    if len(sys.argv) > 1 and sys.argv[1] == '__complete':
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument("--debug", action="store_true")
+    temp_parser.add_argument("-v", "--verbose", action="store_true")
+    temp_parser.add_argument("--config")
+    temp_args, _ = temp_parser.parse_known_args()
+
+    if temp_args.debug:
+        setup_logging(level="DEBUG", verbose=True)
+    elif temp_args.verbose:
+        setup_logging(level="INFO", verbose=True)
+    else:
+        setup_logging()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "__complete":
         __complete_command()
         return
-        
-    # Check if first arg looks like a binary path (but not if using other commands)
-    if (len(sys.argv) > 1 and 
-        (sys.argv[1].startswith('/') or sys.argv[1].startswith('./')) and
-        not any(arg in sys.argv for arg in ['native', 'config', 'shell', 'completion', 'functions', 'symbols', 'xrefs', 'binary'])):
-        _handle_binary_execution()
-        return
-    
+
+    # Standard command mode with subcommands
     parser = argparse.ArgumentParser(
-        prog='ludi',
-        description='LUDI Unifies Decompiler Interface'
+        prog="ludi",
+        description=get_title(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
-    # Add global arguments
-    parser.add_argument('--backend', choices=['ida', 'ghidra', 'angr'], 
-                       help='Backend to use (default: from config/env/auto-discovery)')
-    parser.add_argument('--binary', help='Binary file to analyze')
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Config subcommand
-    config_parser = subparsers.add_parser('config', help='Configuration management')
-    config_cli = ConfigCLI()
-    
-    # Add config subcommands
-    config_subparsers = config_parser.add_subparsers(dest='config_command')
-    
-    # Show
-    show_parser = config_subparsers.add_parser('show', help='Show configuration')
-    show_parser.add_argument('--validate', action='store_true', help='Validate configuration')
-    
-    # Discover
-    discover_parser = config_subparsers.add_parser('discover', help='Auto-discover tools')
-    discover_parser.add_argument('--save', action='store_true', help='Save discovered paths')
-    
-    # Set
-    set_parser = config_subparsers.add_parser('set', help='Set configuration')
-    set_parser.add_argument('backend', help='Backend to configure')
-    set_parser.add_argument('--path', help='Path to executable')
-    set_parser.add_argument('--enabled', type=bool, help='Enable/disable')
-    set_parser.add_argument('--default', action='store_true', help='Set as default')
-    
-    # Test
-    test_parser = config_subparsers.add_parser('test', help='Test installations')
-    test_parser.add_argument('backend', nargs='?', help='Backend to test (default: all)')
-    
-    # Reset
-    reset_parser = config_subparsers.add_parser('reset', help='Reset configuration')
-    reset_parser.add_argument('--confirm', action='store_true', help='Confirm reset')
-    
-    # Shell subcommand
-    subparsers.add_parser('shell', help='Interactive LUDI shell')
-    
-    # Completion subcommand
-    completion_parser = subparsers.add_parser('completion', help='Generate completion scripts')
-    completion_parser.add_argument('shell_type', choices=['bash', 'zsh', 'fish'], 
-                                  help='Shell type to generate completion for')
-    
-    # Native script runner subcommand
-    native_parser = subparsers.add_parser('native', help='Run native backend scripts')
-    native_subparsers = native_parser.add_subparsers(dest='native_action', help='Native script actions')
-    
-    # Run subcommand
-    run_parser = native_subparsers.add_parser('run', help='Run a native script',
-                                             description='''Run native scripts using backend-specific environments.
-Examples:
-  ludi --backend ida native run script.py /bin/ls          # Run IDA Python script
-  ludi --binary /bin/ls native run --backend angr script.py # Run angr script  
-  LUDI_BACKEND=ghidra ludi native run script.py /bin/ls    # Use env variable
-  ludi native run script.py /bin/ls                        # Auto-discover backend''',
-                                             formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Backend will come from global --backend flag
-    run_parser.add_argument('script', help='Script file to execute')
-    run_parser.add_argument('binary', nargs='?', help='Binary file to analyze (optional)')
-    run_parser.add_argument('--args', nargs='*', help='Additional arguments to pass to script')
-    
-    # Add analysis commands dynamically from manager classes
-    analyze_cli = AnalyzeCLI()
-    
-    # Dynamically create subcommands for each manager
-    for manager_name, manager_class in analyze_cli.manager_classes.items():
-        manager_parser = subparsers.add_parser(manager_name, help=f'{manager_name.title()} analysis')
-        # Binary will come from global --binary flag, but allow positional as fallback
-        manager_parser.add_argument('binary', nargs='?', help='Binary file to analyze (optional if --binary used)')
-        # Backend will come from global --backend flag
-        manager_sub = manager_parser.add_subparsers(dest=f'{manager_name}_action', help=f'{manager_name.title()} methods')
-        analyze_cli._add_method_parsers(manager_sub, manager_name, manager_class)
-    
-    # Parse arguments
-    args = parser.parse_args()
-    
+    _setup_command_parser(parser)
+
+    # Manager-specific commands are handled within the binary shell, not as top-level commands
+
+    # Apply shorthand expansion to arguments
+    expanded_args = _expand_shorthand(sys.argv[1:], parser)
+    args = parser.parse_args(expanded_args)
+
+    # Set config path environment variable if provided
+    if hasattr(args, "config") and args.config:
+        os.environ["LUDI_CONFIG_PATH"] = args.config
+
+    # Handle missing command
     if not args.command:
         _display_ascii_art()
         print()
         parser.print_help()
         return
-    
-    # Handle config commands
-    if args.command == 'config':
+
+    config_cli = ConfigCLI()
+
+    if args.command == "analyze":
+        _handle_analyze_command_dynamic(args)
+
+    elif args.command == "config":
+        _handle_config_command_dynamic(args)
+
+    elif args.command == "config_old":
         if not args.config_command:
-            config_parser.print_help()
+            parser._config_parser.print_help()
             return
-        
+
         try:
-            if args.config_command == 'show':
+            if args.config_command == "show":
                 config_cli.show_config(validate=args.validate)
-            elif args.config_command == 'discover':
+            elif args.config_command == "discover":
                 config_cli.discover_tools(save=args.save)
-            elif args.config_command == 'set':
+            elif args.config_command == "set":
                 config_cli.set_config(
                     backend=args.backend,
                     path=args.path,
                     enabled=args.enabled,
-                    default=args.default
+                    default=args.default,
                 )
-            elif args.config_command == 'test':
+            elif args.config_command == "test":
                 config_cli.test_installations(backend=args.backend)
-            elif args.config_command == 'reset':
+            elif args.config_command == "reset":
                 config_cli.reset_config(confirm=args.confirm)
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-    
-    # Handle shell command
-    elif args.command == 'shell':
+
+    elif args.command == "shell":
         _start_interactive_shell()
-    
-    # Handle native script command
-    elif args.command == 'native':
+
+    elif args.command == "server":
+        _start_server(args.host, args.port)
+
+    elif args.command == "native":
         if not args.native_action:
-            native_parser.print_help()
+            parser._native_parser.print_help()
             return
-        elif args.native_action == 'run':
+        elif args.native_action == "run":
             backend, binary = _resolve_backend_and_binary(args)
-            # Use resolved binary or fallback to positional binary argument  
-            target_binary = binary or getattr(args, 'binary', None)
+            target_binary = binary or getattr(args, "binary", None)
             _run_native_script(backend, args.script, target_binary, args.args or [])
-    
-    # Handle completion command
-    elif args.command == 'completion':
+
+    elif args.command == "completion":
         _generate_completion(args.shell_type)
-    
-    # Handle analysis commands dynamically
-    elif args.command in analyze_cli.manager_classes:
-        # Resolve global backend and binary
-        backend, binary = _resolve_backend_and_binary(args)
-        
-        # Use resolved binary or fallback to positional binary argument
-        target_binary = binary or args.binary
-        if not target_binary:
-            print(f"Error: No binary specified. Use --binary flag or provide as positional argument.", file=sys.stderr)
-            sys.exit(1)
-        
-        # Set resolved values on args for compatibility
-        args.backend = backend
-        args.binary = target_binary
-        
-        # Convert args to look like old analyze format for compatibility
-        args.analyze_command = args.command
-        setattr(args, f'{args.command}_action', getattr(args, f'{args.command}_action', None))
-        
-        try:
-            analyze_cli.handle_command(args)
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
 
 
-def _handle_binary_execution():
-    """Handle direct binary execution: ludi /bin/ls or ludi --binary /bin/ls"""
-    
-    # Parse binary path from command line
-    binary_path = None
-    backend = None
-    remaining_args = []
-    
-    args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] == '--binary':
-            if i + 1 < len(args):
-                binary_path = args[i + 1]
-                i += 2
-            else:
-                print("Error: --binary requires a path", file=sys.stderr)
-                sys.exit(1)
-        elif args[i] == '--backend':
-            if i + 1 < len(args):
-                backend = args[i + 1]
-                i += 2
-            else:
-                print("Error: --backend requires a backend name", file=sys.stderr)
-                sys.exit(1)
-        elif args[i].startswith('/') or args[i].startswith('./'):
-            if binary_path is None:
-                binary_path = args[i]
-            else:
-                remaining_args.append(args[i])
-            i += 1
-        else:
-            remaining_args.append(args[i])
-            i += 1
-    
-    if not binary_path:
-        print("Error: No binary path specified", file=sys.stderr)
-        sys.exit(1)
-    
-    if not os.path.exists(binary_path):
-        print(f"Error: Binary not found: {binary_path}", file=sys.stderr)
-        sys.exit(1)
-    
+def _handle_analyze_command_dynamic(args):
+    """Handle analyze command using the package API."""
+    import ludi
+
     try:
-        # Initialize LUDI with the binary
+        # Use the package API directly
+        backend = ludi.analyze(args.binary, backend=getattr(args, "backend", None))
+
+        print(f"Loaded binary: {args.binary}")
+        print(f"Using backend: {backend.backend_name}")
+
+        action = getattr(args, "analyze_action", None)
+
+        if action == "shell":
+            # Start interactive shell
+            _start_binary_shell(backend, args.binary)
+        elif action and action != "shell":
+            # Handle manager commands non-interactively (dynamically discover managers)
+            from ..cli.analyze import AnalyzeCLI
+
+            analyze_cli = AnalyzeCLI()
+
+            # Check if this is a valid manager
+            if action in analyze_cli.manager_classes and action != "backend_name":
+                analyze_cli.backend = backend  # Set the backend
+
+                # Check if a specific method was requested
+                method_action = getattr(args, f"{action}_action", None)
+                if method_action:
+                    # Execute specific method
+                    args.analyze_command = action
+                    analyze_cli.handle_command(args)
+                else:
+                    # Just show the manager object info (consistent with shell)
+                    manager = getattr(backend, action)
+                    print(manager)
+            else:
+                print(f"Error: Unknown action '{action}'", file=sys.stderr)
+                sys.exit(1)
+        elif action is None:
+            # No action specified - show helpful information about the binary
+            _show_analyze_help(backend)
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading binary: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _show_analyze_help(analyzer):
+    """Show helpful information about what can be done with the binary."""
+    from ..cli.analyze import AnalyzeCLI
+
+    analyze_cli = AnalyzeCLI()
+
+    print("\nBinary analysis loaded. Available actions:")
+    print("  shell      - Start interactive shell")
+
+    # Dynamically discover available managers
+    for manager_name in analyze_cli.manager_classes:
+        if manager_name != "backend_name":  # Skip non-manager properties
+            print(f"  {manager_name:<10} - Access {manager_name} manager")
+
+
+def _handle_config_command_dynamic(args):
+    """Handle config command using the package API."""
+    import ludi
+
+    config_obj = ludi.config
+    subcommand = getattr(args, "config_command", None)
+
+    if not subcommand:
+        print("Error: No config subcommand specified", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        method = getattr(config_obj, subcommand)
+
+        # Build kwargs from args
+        import inspect
+
+        sig = inspect.signature(method)
+        kwargs = {}
+
+        for param_name in sig.parameters:
+            if param_name == "self":
+                continue
+
+            # Convert CLI arg names back to method parameter names
+            arg_name = param_name.replace("_", "-")
+            if hasattr(args, arg_name.replace("-", "_")):
+                kwargs[param_name] = getattr(args, arg_name.replace("-", "_"))
+            elif hasattr(args, param_name):
+                kwargs[param_name] = getattr(args, param_name)
+
+        method(**kwargs)
+
+    except AttributeError:
+        print(f"Error: Unknown config command: {subcommand}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _handle_analyze_command(args):
+    """Handle the 'analyze' command."""
+    binary_path = args.binary
+    backend = args.backend
+
+    if not os.path.exists(binary_path):
+        print(f"Error: Binary '{binary_path}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Create analyzer and start binary shell
+    import ludi
+
+    try:
         if backend:
-            analyzer = ludi.LUDI(backend, binary_path)
+            analyzer = ludi.analyze(binary_path, backend=backend)
         else:
             analyzer = ludi.auto(binary_path)
-        
+
         print(f"Loaded binary: {binary_path}")
         print(f"Using backend: {analyzer.backend_name}")
-        
-        # Start interactive mode with the analyzer
+
         _start_binary_shell(analyzer, binary_path)
-        
     except Exception as e:
         print(f"Error loading binary: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 class MainShellCompleter:
-    """Autocomplete for main LUDI shell."""
-    
     def __init__(self):
-        self.commands = ['help', 'exit', 'quit', 'load']
+        self.commands = self._discover_shell_commands()
         self.current_candidates = []
-    
+
+    def _discover_shell_commands(self):
+        """Use shared function to discover shell commands"""
+        return _discover_shell_commands()
+
     def complete(self, text, state):
-        """Return the next possible completion for 'text'."""
         if state == 0:
-            # First call - generate candidates using shared logic
             line = readline.get_line_buffer()
             parts = line.split()
-            
-            # Use shared completion logic for load command
-            if parts and parts[0] == 'load' and len(parts) > 1:
+
+            if parts and parts[0] == "load" and len(parts) > 1:
                 self.current_candidates = _complete_file_path(text)
             else:
-                # Shell-specific commands
-                self.current_candidates = [cmd for cmd in self.commands if cmd.startswith(text)]
-        
+                self.current_candidates = [
+                    cmd for cmd in self.commands if cmd.startswith(text)
+                ]
+
         try:
             return self.current_candidates[state]
         except IndexError:
             return None
-    
 
 
 def _start_interactive_shell():
-    """Start interactive LUDI shell without a binary."""
     _display_ascii_art()
     print()
     print("LUDI Interactive Shell")
@@ -485,90 +585,127 @@ def _start_interactive_shell():
         print("Tab completion enabled")
         completer = MainShellCompleter()
         readline.set_completer(completer.complete)
-        readline.parse_and_bind('tab: complete')
-        # Enable history
+        readline.parse_and_bind("tab: complete")
         try:
-            readline.read_history_file(Path.home() / '.ludi_history')
+            readline.read_history_file(Path.home() / ".ludi_history")
         except (OSError, FileNotFoundError):
             pass
-    
-    print("Type 'help' for commands or 'exit' to quit")
+
+    print("Commands mirror CLI structure: 'analyze', 'config', 'help', 'exit'")
+    print("Type 'help' for examples or use shortcuts like 'a' for analyze")
     print()
-    
+
     try:
         while True:
             try:
                 command = input("ludi> ").strip()
                 if not command:
                     continue
-                    
-                if command in ['exit', 'quit']:
+
+                # Handle special shell commands
+                if command in ["exit", "quit"]:
                     break
-                elif command == 'help':
+                elif command == "help":
                     _print_shell_help()
-                elif command.startswith('load '):
-                    binary_path = command[5:].strip()
-                    if os.path.exists(binary_path):
-                        try:
-                            analyzer = ludi.auto(binary_path)
-                            print(f"Loaded: {binary_path} ({analyzer.backend_name})")
-                            _start_binary_shell(analyzer, binary_path)
-                        except Exception as e:
-                            print(f"Error loading binary: {e}")
-                    else:
-                        print(f"Binary not found: {binary_path}")
                 else:
-                    print(f"Unknown command: {command}. Type 'help' for available commands.")
-                    
+                    # Process command using CLI structure
+                    _execute_shell_command(command)
+
             except KeyboardInterrupt:
                 print("\nUse 'exit' to quit")
             except EOFError:
+                print()
                 break
     finally:
-        # Save history on exit
         if READLINE_AVAILABLE:
             try:
-                readline.write_history_file(Path.home() / '.ludi_history')
+                readline.write_history_file(Path.home() / ".ludi_history")
             except (OSError, PermissionError):
                 pass
-    
+
     print("Goodbye!")
 
 
+def _discover_binary_managers(analyzer):
+    """Shared function to discover managers from analyzer"""
+    managers = {}
+
+    # Dynamically discover all manager attributes
+    for name in dir(analyzer):
+        if not name.startswith("_"):
+            try:
+                attr = getattr(
+                    analyzer, name
+                )  # Use analyzer to get through __getattr__
+                # Check if it's a manager by checking if it has callable methods that look like manager methods
+                if attr and hasattr(attr, "__class__"):
+                    methods = [
+                        n
+                        for n in dir(attr)
+                        if not n.startswith("_") and callable(getattr(attr, n))
+                    ]
+                    # Consider it a manager if it has multiple manager-like methods
+                    manager_methods = [
+                        m
+                        for m in methods
+                        if m
+                        in [
+                            "all",
+                            "by_name",
+                            "by_address",
+                            "strings",
+                            "types",
+                            "variables",
+                            "segments",
+                            "imports",
+                            "exports",
+                            "entry_points",
+                            "sections",
+                            "file_info",
+                        ]
+                    ]
+                    if len(manager_methods) >= 2:  # Has at least 2 manager methods
+                        managers[name] = methods
+            except AttributeError:
+                # Skip if attribute can't be accessed
+                continue
+
+    return managers
+
+
 class BinaryShellCompleter:
-    """Autocomplete for binary LUDI shell."""
-    
     def __init__(self, analyzer):
         self.analyzer = analyzer
-        self.manager_names = list(analyzer._decompiler.__class__.__dict__.keys())
-        # Get actual manager names from the analyzer
-        self.managers = {}
-        for name in ['functions', 'symbols', 'xrefs', 'binary']:
-            if hasattr(analyzer, name):
-                manager = getattr(analyzer, name)
-                methods = [n for n in dir(manager) if not n.startswith('_') and callable(getattr(manager, n))]
-                self.managers[name] = methods
-        
-        self.commands = ['help', 'back', 'exit'] + list(self.managers.keys())
+        self.managers = _discover_binary_managers(analyzer)
+        control_commands = _discover_binary_shell_commands()
+        self.commands = control_commands + list(self.managers.keys())
         self.current_candidates = []
-    
+
     def complete(self, text, state):
-        """Return the next possible completion for 'text'."""
         if state == 0:
-            # First call - generate candidates
             line = readline.get_line_buffer()
             parts = line.split()
-            
-            if len(parts) <= 1:
-                # Completing command/manager
-                self.current_candidates = [cmd for cmd in self.commands if cmd.startswith(text)]
-            elif len(parts) == 2 and parts[0] in self.managers:
-                # Completing method name
+
+            # If no parts or still typing the first word
+            if not parts or (len(parts) == 1 and not line.endswith(" ")):
+                self.current_candidates = [
+                    cmd for cmd in self.commands if cmd.startswith(text)
+                ]
+            # If we have a manager name and a space after it (ready for method)
+            elif len(parts) == 1 and line.endswith(" ") and parts[0] in self.managers:
                 manager_methods = self.managers[parts[0]]
-                self.current_candidates = [method for method in manager_methods if method.startswith(text)]
+                self.current_candidates = [
+                    method for method in manager_methods if method.startswith(text)
+                ]
+            # If typing second word (method name)
+            elif len(parts) == 2 and parts[0] in self.managers:
+                manager_methods = self.managers[parts[0]]
+                self.current_candidates = [
+                    method for method in manager_methods if method.startswith(text)
+                ]
             else:
                 self.current_candidates = []
-        
+
         try:
             return self.current_candidates[state]
         except IndexError:
@@ -576,163 +713,190 @@ class BinaryShellCompleter:
 
 
 def _start_binary_shell(analyzer, binary_path):
-    """Start interactive shell with loaded binary."""
-    
     print(f"Binary shell for: {binary_path}")
-    print("Available managers: functions, symbols, xrefs, binary")
+
+    # Create completer to discover managers
     if READLINE_AVAILABLE:
         print("Tab completion enabled")
         completer = BinaryShellCompleter(analyzer)
         readline.set_completer(completer.complete)
-        readline.parse_and_bind('tab: complete')
-    
+        readline.parse_and_bind("tab: complete")
+    else:
+        completer = BinaryShellCompleter(analyzer)
+
+    # Display discovered managers dynamically
+    managers = list(completer.managers.keys())
+    if managers:
+        print(f"Available managers: {', '.join(sorted(managers))}")
+
     print("Type 'help' for commands or 'back' to return to main shell")
     print()
-    
+
     while True:
         try:
             command = input(f"ludi:{Path(binary_path).name}> ").strip()
             if not command:
                 continue
-                
-            if command in ['back', 'exit']:
+
+            if command in ["back", "exit"]:
                 break
-            elif command == 'help':
-                _print_binary_shell_help()
+            elif command == "help":
+                _print_binary_shell_help(analyzer)
             else:
                 _execute_binary_command(analyzer, command)
-                
+
         except KeyboardInterrupt:
             print("\nUse 'back' to return or 'exit' to quit")
         except EOFError:
+            print()
             break
 
 
 def get_completions(words, current_word_index):
-    """Get completions for command line - shared between shell and bash completion."""
     if not words:
         return []
-    
+
     current_word = words[current_word_index] if current_word_index < len(words) else ""
-    
-    # Handle direct binary execution (ludi /bin/ls style)
-    if len(words) == 1 and (current_word.startswith('/') or current_word.startswith('./')):
+
+    if len(words) == 1 and (
+        current_word.startswith("/") or current_word.startswith("./")
+    ):
         return _complete_file_path(current_word)
-    
-    # Main command completion
+
     if len(words) == 1:
-        commands = ['config', 'shell', 'completion', 'native']
-        # Add manager commands dynamically
+        commands = ["config", "shell", "completion", "native", "backends"]
         try:
             from .analyze import AnalyzeCLI
+
             analyze_cli = AnalyzeCLI()
-            commands.extend(analyze_cli.manager_classes.keys())
-        except:
-            commands.extend(['functions', 'symbols', 'xrefs', 'binary'])
+            commands.extend(
+                [
+                    name
+                    for name in analyze_cli.manager_classes.keys()
+                    if name != "backend_name"
+                ]
+            )
+        except ImportError:
+            # Fallback - check if base managers module exists
+            import importlib.util
+
+            if importlib.util.find_spec("ludi.backends.base.managers"):
+                # Basic managers are available
+                commands.extend(["functions", "binary", "symbols", "xrefs"])
         return [cmd for cmd in commands if cmd.startswith(current_word)]
-    
+
     cmd = words[0]
-    
-    # Config command completions
-    if cmd == 'config' and len(words) == 2:
-        subcommands = ['show', 'discover', 'set', 'test', 'reset']
+
+    if cmd == "config" and len(words) == 2:
+        subcommands = ["show", "discover", "set", "test", "reset"]
         return [sub for sub in subcommands if sub.startswith(current_word)]
-    
-    if cmd == 'config' and len(words) == 3 and words[1] == 'set':
-        backends = ['ida', 'ghidra', 'angr']
+
+    if cmd == "config" and len(words) == 3 and words[1] == "set":
+        from ..core.utils import get_config_manager
+
+        config_manager = get_config_manager()
+        backends = list(config_manager.load_config().keys())
         return [b for b in backends if b.startswith(current_word)]
-    
-    # Completion command completions  
-    if cmd == 'completion' and len(words) == 2:
-        shells = ['bash', 'zsh', 'fish']
+
+    if cmd == "completion" and len(words) == 2:
+        shells = ["bash", "zsh", "fish"]
         return [s for s in shells if s.startswith(current_word)]
-    
-    # Native command completions
-    if cmd == 'native':
+
+    if cmd == "native":
         if len(words) == 2:
-            # Complete native subcommands
-            return ['run']
-        elif len(words) >= 3 and words[1] == 'run':
-            # Handle 'native run' completions
-            if '--backend' in words:
-                # Find backend value index
-                backend_idx = words.index('--backend')
+            return ["run"]
+        elif len(words) >= 3 and words[1] == "run":
+            if "--backend" in words:
+                backend_idx = words.index("--backend")
                 if backend_idx + 1 < len(words):
-                    # Backend already specified, complete script files
-                    return _complete_file_path(current_word, extensions=['.py', '.java', '.js'])
+                    return _complete_file_path(
+                        current_word, extensions=[".py", ".java", ".js"]
+                    )
                 else:
-                    # Complete backend names
-                    backends = ['ida', 'ghidra', 'angr']
-                    return [backend for backend in backends if backend.startswith(current_word)]
-            elif current_word == '--backend' or (len(words) >= 4 and words[-2] == '--backend'):
-                # Complete backend names after --backend
-                backends = ['ida', 'ghidra', 'angr']
-                return [backend for backend in backends if backend.startswith(current_word)]
-            elif current_word.startswith('--'):
-                # Complete flag options
-                return ['--backend', '--args']
+                    from ..core.utils import get_config_manager
+
+                    config_manager = get_config_manager()
+                    backends = list(config_manager.load_config().keys())
+                    return [
+                        backend
+                        for backend in backends
+                        if backend.startswith(current_word)
+                    ]
+            elif current_word == "--backend" or (
+                len(words) >= 4 and words[-2] == "--backend"
+            ):
+                from ..core.utils import get_config_manager
+
+                config_manager = get_config_manager()
+                backends = list(config_manager.load_config().keys())
+                return [
+                    backend for backend in backends if backend.startswith(current_word)
+                ]
+            elif current_word.startswith("--"):
+                return ["--backend", "--args"]
             else:
-                # Complete script files or suggest --backend
-                if not any(w.startswith('--backend') for w in words):
-                    return ['--backend']
-                return _complete_file_path(current_word, extensions=['.py', '.java', '.js'])
-    
-    # Manager command completions
+                if not any(w.startswith("--backend") for w in words):
+                    return ["--backend"]
+                return _complete_file_path(
+                    current_word, extensions=[".py", ".java", ".js"]
+                )
+
     try:
         from .analyze import AnalyzeCLI
+
         analyze_cli = AnalyzeCLI()
         if cmd in analyze_cli.manager_classes:
             if len(words) == 2:
-                # Complete binary path
                 return _complete_file_path(current_word)
             elif len(words) == 3:
-                # Complete manager methods - try to get backend-specific methods
-                # First try to load analyzer if binary path is valid
                 binary_path = words[1] if len(words) > 1 else None
                 if binary_path and os.path.exists(binary_path):
                     try:
-                        # Try to get runtime methods for the specific backend
                         analyze_cli.init_analyzer(binary_path)
                         methods = analyze_cli.get_runtime_methods(cmd)
-                    except:
-                        # Fallback to base class methods
+                    except Exception:
                         manager_class = analyze_cli.manager_classes[cmd]
-                        methods = [name for name in dir(manager_class) 
-                                  if not name.startswith('_') and callable(getattr(manager_class, name, None))]
+                        methods = [
+                            name
+                            for name in dir(manager_class)
+                            if not name.startswith("_")
+                            and callable(getattr(manager_class, name, None))
+                        ]
                 else:
-                    # No valid binary, use base class methods
                     manager_class = analyze_cli.manager_classes[cmd]
-                    methods = [name for name in dir(manager_class) 
-                              if not name.startswith('_') and callable(getattr(manager_class, name, None))]
-                
+                    methods = [
+                        name
+                        for name in dir(manager_class)
+                        if not name.startswith("_")
+                        and callable(getattr(manager_class, name, None))
+                    ]
+
                 return [method for method in methods if method.startswith(current_word)]
-    except Exception as e:
-        # Fallback silently
+    except Exception:
         pass
-    
+
     return []
 
 
 def _complete_file_path(partial_path, extensions=None):
-    """Complete file paths - shared helper."""
     if not partial_path:
-        partial_path = '.'
-    
+        partial_path = "."
+
     try:
         path = Path(partial_path)
         if path.is_dir():
-            # Complete directory contents
             candidates = []
             for item in path.iterdir():
                 item_path = str(item)
                 if item.is_dir():
-                    item_path += '/'
+                    item_path += "/"
                     candidates.append(item_path)
-                elif not extensions or any(item.name.endswith(ext) for ext in extensions):
+                elif not extensions or any(
+                    item.name.endswith(ext) for ext in extensions
+                ):
                     candidates.append(item_path)
             return candidates
         else:
-            # Complete partial filename
             parent = path.parent
             name_prefix = path.name
             candidates = []
@@ -741,9 +905,11 @@ def _complete_file_path(partial_path, extensions=None):
                     if item.name.startswith(name_prefix):
                         item_path = str(item)
                         if item.is_dir():
-                            item_path += '/'
+                            item_path += "/"
                             candidates.append(item_path)
-                        elif not extensions or any(item.name.endswith(ext) for ext in extensions):
+                        elif not extensions or any(
+                            item.name.endswith(ext) for ext in extensions
+                        ):
                             candidates.append(item_path)
             except (OSError, PermissionError):
                 pass
@@ -753,152 +919,270 @@ def _complete_file_path(partial_path, extensions=None):
 
 
 def _generate_completion(shell_type):
-    """Generate completion script for the specified shell."""
-    if shell_type == 'bash':
+    if shell_type == "bash":
         _generate_bash_completion()
-    elif shell_type == 'zsh':
+    elif shell_type == "zsh":
         print("# ZSH completion not yet implemented")
         sys.exit(1)
-    elif shell_type == 'fish':
-        print("# Fish completion not yet implemented") 
+    elif shell_type == "fish":
+        print("# Fish completion not yet implemented")
         sys.exit(1)
-
-
-def _generate_bash_completion():
-    """Generate bash completion script that calls back to ludi."""
-    script = '''#!/bin/bash
-# Bash completion script for LUDI
-# Generated by: ludi completion bash
-
-_ludi_complete() {
-    local cur prev words cword
-    _init_completion || return
-    
-    # Call ludi to get completions
-    local completions
-    completions=$(ludi __complete "${COMP_WORDS[@]:1}" 2>/dev/null)
-    
-    if [[ -n "$completions" ]]; then
-        COMPREPLY=($(compgen -W "$completions" -- "$cur"))
-    else
-        # Fallback to file completion
-        COMPREPLY=($(compgen -f "$cur"))
-    fi
-}
-
-complete -F _ludi_complete ludi
-
-# Installation instructions:
-# Save this script and source it, or save to /etc/bash_completion.d/ludi
-# To install: ludi completion bash > /etc/bash_completion.d/ludi
-# Or: ludi completion bash > ~/.local/share/bash-completion/completions/ludi
-'''
-    print(script)
 
 
 def __complete_command():
-    """Hidden command for bash completion - handles completion requests."""
-    words = sys.argv[2:]  # Skip 'ludi __complete'
-    if not words:
-        return
-    
-    # Get completions using shared logic
-    current_word_index = len(words) - 1
-    completions = get_completions(words, current_word_index)
-    
-    # Print completions for bash to use
-    for completion in completions:
-        print(completion)
+    pass
 
 
-def _execute_binary_command(analyzer, command):
-    """Execute command in binary context."""
-    parts = command.split()
-    if not parts:
-        return
-        
-    manager_name = parts[0]
-    if manager_name not in ['functions', 'symbols', 'xrefs', 'binary']:
-        print(f"Unknown manager: {manager_name}")
-        print("Available managers: functions, symbols, xrefs, binary")
-        return
-    
-    manager = getattr(analyzer, manager_name)
-    
-    if len(parts) == 1:
-        # Show available methods
-        print(f"Available {manager_name} methods:")
-        methods = [name for name in dir(manager) if not name.startswith('_') and callable(getattr(manager, name))]
-        for method in sorted(methods):
-            print(f"  {method}")
-        return
-    
-    method_name = parts[1]
-    if not hasattr(manager, method_name):
-        print(f"Unknown method: {method_name}")
-        return
-    
-    method = getattr(manager, method_name)
+def _start_server(host, port):
+    logger.info(f"Server functionality not implemented (would start on {host}:{port})")
+
+
+def _discover_shell_commands():
+    """Discover shell commands using same system as CLI."""
+    from ..core import discover_commands
+
+    commands = discover_commands()
+    shell_commands = list(commands.keys()) + ["help", "exit"]
+    return shell_commands
+
+
+def _execute_shell_command(command):
+    """Execute a shell command using the same discovery and structure as CLI."""
     try:
-        # Simple method call without arguments for now
-        result = method()
-        _display_result(result)
-    except Exception as e:
-        print(f"Error executing {manager_name}.{method_name}(): {e}")
+        # Parse the command into arguments
+        args = command.split()
+        if not args:
+            return
 
+        # Discover available commands using same system as CLI
+        from ..core import discover_commands
 
-def _display_result(result):
-    """Display method result."""
-    if result is None:
-        print("None")
-    elif isinstance(result, (list, tuple)):
-        if not result:
-            print("[]")
+        discovered_commands = discover_commands()
+        shell_commands = list(discovered_commands.keys()) + ["help", "exit"]
+
+        # Expand shorthand commands for shell
+        first_arg = args[0]
+        matches = [cmd for cmd in shell_commands if cmd.startswith(first_arg)]
+        if len(matches) == 1:
+            args[0] = matches[0]
+
+        expanded_args = args
+        first_arg = expanded_args[0] if expanded_args else ""
+
+        if first_arg == "analyze":
+            _handle_shell_analyze_command(expanded_args)
+        elif first_arg == "config":
+            _handle_shell_config_command(expanded_args)
+        elif first_arg in discovered_commands:
+            print(
+                f"Command '{first_arg}' is available but not yet implemented in shell mode"
+            )
         else:
-            for item in result:
-                _display_item(item)
-    else:
-        _display_item(result)
+            print(f"Unknown command: {first_arg}")
+            available_cmds = ", ".join(shell_commands)
+            print(f"Available commands: {available_cmds}")
+            print("Use shortcuts: 'a' for analyze, 'c' for config")
+
+    except Exception as e:
+        print(f"Command error: {e}")
 
 
-def _display_item(item):
-    """Display a single item."""
-    if hasattr(item, 'name') and hasattr(item, 'start'):
-        # Function-like object
-        print(f"{item.name or 'unnamed'} @ 0x{item.start:x}")
-    elif hasattr(item, 'name') and hasattr(item, 'address'):
-        # Symbol-like object
-        print(f"{item.name} @ 0x{item.address:x}")
-    elif hasattr(item, 'from_addr') and hasattr(item, 'to_addr'):
-        # XRef-like object
-        print(f"0x{item.from_addr:x} -> 0x{item.to_addr:x} ({item.xref_type})")
-    elif isinstance(item, dict):
-        # Dict result (like segments, sections)
-        formatted = ', '.join(f"{k}: {v}" for k, v in item.items())
-        print(f"{{{formatted}}}")
-    else:
-        print(str(item))
+def _handle_shell_analyze_command(args):
+    """Handle analyze command in shell using package API."""
+    if len(args) < 2:
+        print("Usage: analyze [--backend BACKEND] <binary>")
+        return
+
+    binary_path = None
+    backend = None
+
+    # Parse arguments
+    i = 1
+    while i < len(args):
+        if args[i] == "--backend" and i + 1 < len(args):
+            backend = args[i + 1]
+            i += 2
+        elif not args[i].startswith("-"):
+            binary_path = args[i]
+            i += 1
+        else:
+            i += 1
+
+    if not binary_path:
+        print("Error: No binary path provided")
+        return
+
+    if not os.path.exists(binary_path):
+        print(f"Error: Binary '{binary_path}' not found")
+        return
+
+    # Use the same package API as CLI
+    import ludi
+
+    try:
+        analyzer = ludi.analyze(binary_path, backend=backend)
+        print(f"Loaded binary: {binary_path}")
+        print(f"Using backend: {analyzer.backend_name}")
+        _start_binary_shell(analyzer, binary_path)
+    except Exception as e:
+        print(f"Error loading binary: {e}")
+
+
+def _handle_shell_config_command(args):
+    """Handle config command in shell using package API."""
+    if len(args) < 2:
+        print("Usage: config <show|discover|set|test|reset> [args...]")
+        return
+
+    import ludi
+
+    config_obj = ludi.config
+    subcommand = args[1]
+
+    try:
+        if subcommand == "show":
+            config_obj.show()
+        elif subcommand == "discover":
+            config_obj.discover()
+        elif subcommand == "test":
+            backend = args[2] if len(args) > 2 else None
+            config_obj.test(backend=backend)
+        elif subcommand == "set":
+            print("Config set not yet supported in shell mode")
+        elif subcommand == "reset":
+            print("Config reset not yet supported in shell mode")
+        else:
+            print(f"Unknown config subcommand: {subcommand}")
+    except Exception as e:
+        print(f"Config error: {e}")
 
 
 def _print_shell_help():
-    """Print help for main shell."""
-    _display_ascii_art()
+    """Print help for shell commands that mirror CLI structure."""
+    print("Available commands (dynamically discovered, consistent with CLI):")
     print()
+
+    # Get commands from discovery system
+    from ..core import discover_commands
+
+    discovered_commands = discover_commands()
+
+    commands = []
+    for cmd_name in discovered_commands.keys():
+        if cmd_name == "analyze":
+            commands.append(("analyze", "Analyze a binary file"))
+        elif cmd_name == "config":
+            commands.append(("config", "Configuration management"))
+        else:
+            commands.append((cmd_name, f"{cmd_name.title()} command"))
+
+    commands.extend([("help", "Show this help message"), ("exit", "Exit LUDI shell")])
+
+    for cmd, desc in commands:
+        print(f"  {cmd:<10} - {desc}")
+
+    print()
+    print("Examples:")
+    print("  analyze /bin/ls                 # Auto-select backend")
+    print("  analyze --backend angr /bin/ls  # Use specific backend")
+    print("  config show                     # Show configuration")
+    print("  a /bin/ls                       # Shorthand for 'analyze'")
+    print("  c show                          # Shorthand for 'config show'")
+
+
+def _list_available_backends():
+    from ..core.utils import get_config_manager
+
+    manager = get_config_manager()
+    available_backends = manager.get_available_backend_configs()
+    all_backends = list(manager._config.keys()) if manager._loaded else []
+
+    if not all_backends:
+        manager.load_config()
+        all_backends = list(manager._config.keys())
+
+    print(
+        f"Available backends ({len(available_backends)}/{len(all_backends)}):",
+        ", ".join(available_backends),
+    )
+
+
+def _discover_binary_shell_commands():
+    """Discover binary shell commands using shared utility"""
+    from ..core.utils import discover_commands_from_function
+
+    fallback = ["help", "back", "exit"]
+    return discover_commands_from_function(_start_binary_shell, fallback)
+
+
+def _print_binary_shell_help(analyzer=None):
+    # Get available managers using shared discovery
+    managers = []
+    if analyzer:
+        discovered_managers = _discover_binary_managers(analyzer)
+        managers = list(discovered_managers.keys())
+
+    # Get control commands dynamically
+    control_commands = _discover_binary_shell_commands()
+
+    # Display help
     print("Available commands:")
-    print("  load <binary_path>  - Load a binary for analysis")
-    print("  help               - Show this help")
-    print("  exit               - Exit LUDI shell")
+    if managers:
+        print(f"  Managers: {', '.join(sorted(managers))}")
+    print(f"  Control: {', '.join(sorted(control_commands))}")
+    print("\nUsage: <manager> <method> [args...]")
+    if managers:
+        # Use first manager as example
+        example_manager = sorted(managers)[0]
+        print(f"Example: {example_manager} all")
+    print("\nType manager name + TAB to see available methods")
 
 
-def _print_binary_shell_help():
-    """Print help for binary shell."""
-    print("Available commands:")
-    print("  <manager>          - Show methods for manager (functions, symbols, xrefs, binary)")
-    print("  <manager> <method> - Execute method on manager")
-    print("  help               - Show this help") 
-    print("  back               - Return to main shell")
-    print("  exit               - Exit LUDI shell")
+def _display_result(result):
+    from ..core.utils import display_result
+
+    display_result(result)
 
 
-if __name__ == '__main__':
-    main()
+def _execute_binary_command(analyzer, command):
+    parts = command.strip().split()
+    if not parts:
+        return
+
+    manager_name = parts[0].lower()
+    method_name = parts[1] if len(parts) > 1 else None
+
+    # Parse --key=value style arguments
+    kwargs = {}
+    args = []
+    for arg in parts[2:]:
+        if arg.startswith("--") and "=" in arg:
+            key, value = arg[2:].split("=", 1)
+            kwargs[key] = value
+        else:
+            args.append(arg)
+
+    if hasattr(analyzer, manager_name):
+        manager = getattr(analyzer, manager_name)
+
+        if method_name:
+            if hasattr(manager, method_name):
+                method = getattr(manager, method_name)
+                if callable(method):
+                    try:
+                        result = method(*args, **kwargs)
+                        _display_result(result)
+                    except Exception as e:
+                        print(f"Error: {e}")
+                else:
+                    print(f"{method_name} is not callable")
+            else:
+                print(f"No method {method_name}")
+        else:
+            print(manager)
+    else:
+        print(f"Unknown: {manager_name}")
+
+
+def _generate_bash_completion():
+    pass
